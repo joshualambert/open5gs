@@ -20,7 +20,7 @@
 #include "test-common.h"
 
 const uint8_t test_dhcpv6_all_servers_addr[OGS_IPV6_LEN] = {
-    0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x02
+    0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0x02
 };
 
 /*
