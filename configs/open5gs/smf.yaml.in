@@ -50,6 +50,24 @@ smf:
     - 2001:4860:4860::8888
     - 2001:4860:4860::8844
   mtu: 1400
+# DHCPv6 prefix delegation server (RFC 8415), used when a session has a
+# network prefix shorter than /64 (session[].prefix_delegation). All keys are
+# optional; the defaults below apply when the section is absent.
+#  dhcpv6:
+#    duid: 00:04:2c:0d:8b:7e:1f:a3:5d:9c:4e:6b:7a:1c:2d:3e:4f:50
+#                              # Server DUID, 3..130 hexadecimal octets with
+#                              # optional ':' separators. Default: a DUID-UUID
+#                              # (type 4) derived from SHA-256 of the first
+#                              # configured PFCP server address, hence stable
+#                              # across restarts.
+#    preferred_lifetime: 3600  # seconds, > 0
+#    valid_lifetime: 7200      # seconds, >= preferred_lifetime
+#    t1: 1800                  # seconds, default 0.5 * preferred_lifetime
+#    t2: 2880                  # seconds, default 0.8 * preferred_lifetime
+#                              # (t1 <= t2 <= valid_lifetime; 0 lets the
+#                              # client choose)
+#    rapid_commit: true        # answer Solicit + Rapid Commit with a Reply
+#    preference: 0             # OPTION_PREFERENCE (0..255), 0 = not sent
 #  p-cscf:
 #    - 127.0.0.1
 #    - ::1

@@ -100,6 +100,51 @@ smf_metrics_spec_def_t smf_metrics_spec_def_global[_SMF_METR_GLOB_MAX] = {
     .name = "fivegs_smffunction_sm_n4sessionreportsucc",
     .description = "Number of successful N4 session reports evidented by SMF",
 },
+[SMF_METR_GLOB_CTR_DHCPV6_RX_SOLICIT] = {
+    .type = OGS_METRICS_METRIC_TYPE_COUNTER,
+    .name = "dhcpv6_rx_solicit",
+    .description = "Received DHCPv6 Solicit messages",
+},
+[SMF_METR_GLOB_CTR_DHCPV6_RX_REQUEST] = {
+    .type = OGS_METRICS_METRIC_TYPE_COUNTER,
+    .name = "dhcpv6_rx_request",
+    .description = "Received DHCPv6 Request messages",
+},
+[SMF_METR_GLOB_CTR_DHCPV6_RX_RENEW] = {
+    .type = OGS_METRICS_METRIC_TYPE_COUNTER,
+    .name = "dhcpv6_rx_renew",
+    .description = "Received DHCPv6 Renew messages",
+},
+[SMF_METR_GLOB_CTR_DHCPV6_RX_REBIND] = {
+    .type = OGS_METRICS_METRIC_TYPE_COUNTER,
+    .name = "dhcpv6_rx_rebind",
+    .description = "Received DHCPv6 Rebind messages",
+},
+[SMF_METR_GLOB_CTR_DHCPV6_RX_RELEASE] = {
+    .type = OGS_METRICS_METRIC_TYPE_COUNTER,
+    .name = "dhcpv6_rx_release",
+    .description = "Received DHCPv6 Release messages",
+},
+[SMF_METR_GLOB_CTR_DHCPV6_RX_INFORMATION_REQUEST] = {
+    .type = OGS_METRICS_METRIC_TYPE_COUNTER,
+    .name = "dhcpv6_rx_information_request",
+    .description = "Received DHCPv6 Information-request messages",
+},
+[SMF_METR_GLOB_CTR_DHCPV6_RX_DROPPED] = {
+    .type = OGS_METRICS_METRIC_TYPE_COUNTER,
+    .name = "dhcpv6_rx_dropped",
+    .description = "DHCPv6 messages discarded (malformed or not answerable)",
+},
+[SMF_METR_GLOB_CTR_DHCPV6_TX_ADVERTISE] = {
+    .type = OGS_METRICS_METRIC_TYPE_COUNTER,
+    .name = "dhcpv6_tx_advertise",
+    .description = "Sent DHCPv6 Advertise messages",
+},
+[SMF_METR_GLOB_CTR_DHCPV6_TX_REPLY] = {
+    .type = OGS_METRICS_METRIC_TYPE_COUNTER,
+    .name = "dhcpv6_tx_reply",
+    .description = "Sent DHCPv6 Reply messages",
+},
 /* Global Gauges: */
 [SMF_METR_GLOB_GAUGE_UES_ACTIVE] = {
     .type = OGS_METRICS_METRIC_TYPE_GAUGE,
