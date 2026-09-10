@@ -46,6 +46,7 @@ extern "C" {
 
 #include "common/context.h"
 #include "common/sctp.h"
+#include "common/dhcpv6.h"
 #include "common/gtpu.h"
 #include "common/application.h"
 #include "common/gmm-build.h"

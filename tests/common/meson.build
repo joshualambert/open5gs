@@ -23,6 +23,7 @@ configure_file(output : 'test-config-private.h',
 libtestcommon_sources = files('''
     sctp.c
     gtpu.c
+    dhcpv6.c
     context.c
     application.c
 

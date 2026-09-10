@@ -533,6 +533,11 @@ int test_db_insert_ue(test_ue_t *test_ue, bson_t *doc);
 int test_db_remove_ue(test_ue_t *test_ue);
 
 bson_t *test_db_new_simple(test_ue_t *test_ue);
+/* session_type: 1=IPv4, 2=IPv6, 3=IPv4v6 (OGS_PDU_SESSION_TYPE_*) */
+bson_t *test_db_new_session_type(test_ue_t *test_ue, int session_type);
+/* Same, with a static UE IPv6 address (e.g. "2001:db8:cafe:4200::1") */
+bson_t *test_db_new_static_ipv6(
+        test_ue_t *test_ue, int session_type, const char *ipv6);
 bson_t *test_db_new_qos_flow(test_ue_t *test_ue);
 bson_t *test_db_new_qos_flow_bi_directional(test_ue_t *test_ue);
 bson_t *test_db_new_session(test_ue_t *test_ue);
