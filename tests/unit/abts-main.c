@@ -41,6 +41,7 @@ abts_suite *test_crash(abts_suite *suite);
 abts_suite *test_mme_dns_select(abts_suite *suite);
 abts_suite *test_ipfw(abts_suite *suite);
 abts_suite *test_pfcp_rule(abts_suite *suite);
+abts_suite *test_dhcpv6(abts_suite *suite);
 
 const struct testlist {
     abts_suite *(*func)(abts_suite *suite);
@@ -57,6 +58,7 @@ const struct testlist {
     {test_mme_dns_select},
     {test_ipfw},
     {test_pfcp_rule},
+    {test_dhcpv6},
     {NULL},
 };
 

@@ -32,6 +32,18 @@ int ogs_gtpu_parse_header(
         ogs_gtp2_header_desc_t *header_desc, ogs_pkbuf_t *pkbuf);
 uint16_t ogs_in_cksum(uint16_t *addr, int len);
 
+/*
+ * RFC 8200 section 8.1 upper-layer checksum: the IPv6 pseudo-header
+ * (src, dst, 32-bit upper-layer length, 3 zero octets, next header) is
+ * folded together with `payload` (the UDP/ICMPv6 header plus data) without
+ * copying it. The result is the one's complement in network byte order,
+ * ready to be stored directly into udph->uh_sum / icmp6_cksum. For UDP a
+ * computed value of 0 must be transmitted as 0xffff (RFC 8200 section 8.1);
+ * this is left to the caller.
+ */
+uint16_t ogs_in6_cksum(const uint8_t *src, const uint8_t *dst, uint8_t nxt,
+        const void *payload, size_t len);
+
 typedef struct ogs_gtp2_sender_f_teid_s {
     bool teid_presence;
     uint32_t teid;

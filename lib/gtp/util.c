@@ -181,6 +181,42 @@ uint16_t ogs_in_cksum(uint16_t *addr, int len)
     return answer;
 }
 
+uint16_t ogs_in6_cksum(const uint8_t *src, const uint8_t *dst, uint8_t nxt,
+        const void *payload, size_t len)
+{
+    const uint8_t *p = payload;
+    uint64_t sum = 0;
+    size_t i;
+
+    ogs_assert(src);
+    ogs_assert(dst);
+    ogs_assert(payload || len == 0);
+
+    /* Pseudo-header: source and destination address */
+    for (i = 0; i < OGS_IPV6_LEN; i += 2) {
+        sum += ((uint32_t)src[i] << 8) | src[i+1];
+        sum += ((uint32_t)dst[i] << 8) | dst[i+1];
+    }
+    /* Upper-layer packet length (32 bit) */
+    sum += ((uint64_t)len >> 16) & 0xffff;
+    sum += (uint64_t)len & 0xffff;
+    /* 3 zero octets + next header */
+    sum += nxt;
+
+    /* Upper-layer header and data, 16 bits at a time */
+    for (i = 0; i + 1 < len; i += 2)
+        sum += ((uint32_t)p[i] << 8) | p[i+1];
+
+    /* If an odd byte is left it is padded with a zero octet */
+    if (len & 1)
+        sum += (uint32_t)p[len-1] << 8;
+
+    while (sum >> 16)
+        sum = (sum & 0xffff) + (sum >> 16);
+
+    return htobe16((uint16_t)~sum);
+}
+
 void ogs_gtp2_sender_f_teid(
         ogs_gtp2_sender_f_teid_t *sender_f_teid, ogs_gtp2_message_t *message)
 {
