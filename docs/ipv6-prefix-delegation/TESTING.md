@@ -84,3 +84,25 @@ The DHCPv6 parser also has a libFuzzer target,
 4. Capture on the S1-U/N3 side (`tcpdump -ni any udp port 2152`) to see the
    DHCPv6 exchange inside GTP-U if the CPE misbehaves; Wireshark decodes
    GTP-U → IPv6 → UDP → DHCPv6.
+
+## Validation status
+
+Validated in Docker on Ubuntu 24.04 (Noble), 2026-09-10:
+
+* Full Open5GS suite: 17/17 pass, including the new `ipv6-pd` suite
+  (26 scenarios across EPC and 5GC, IPv4v6 and IPv6-only, static and
+  dynamic delegation).
+* `ipv6-pd` run three additional times back to back: no flakiness.
+* AddressSanitizer + UndefinedBehaviorSanitizer: the `dhcpv6` and
+  `pfcp-ue-ip` unit suites and the `ipv6-pd` integration suite are clean.
+  No sanitizer finding points at any prefix-delegation source file
+  (`lib/proto/dhcpv6.c`, `src/smf/dhcpv6.c`, `lib/gtp/util.c`,
+  `src/upf/*`, `lib/pfcp/*`). Pre-existing UBSan notes in
+  `lib/nas/*/ies.c` and `lib/asn1c/util/conv.c`, and a freeDiameter
+  extension ODR-violation false positive, are unrelated to this work.
+* The DHCPv6 message parser has a libFuzzer target
+  (`tests/fuzzing/dhcpv6-message-fuzz.c`).
+
+Hardware validation (Global Telecom Titan 4000, Nokia FastMile 5G-16A in
+IP passthrough on an HX510) is performed separately following the "Testing
+with real hardware" steps above.
