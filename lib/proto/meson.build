@@ -22,11 +22,13 @@ libproto_sources = files('''
     conv.h
     event.h
     timer.h
+    ogs-dhcpv6.h
 
     types.c
     conv.c
     event.c
     timer.c
+    dhcpv6.c
 '''.split())
 
 libproto_inc = include_directories('.')

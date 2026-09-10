@@ -30,6 +30,7 @@ testunit_unit_sources = files('''
     ipfw-test.c
     pfcp-rule-test.c
     pfcp-ue-ip-test.c
+    dhcpv6-test.c
 '''.split())
 
 testunit_unit_exe = executable('unit',

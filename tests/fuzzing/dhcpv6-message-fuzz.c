@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019-2022 by Sukchan Lee <acetcom@gmail.com>
+ * Copyright (C) 2019-2023 by Sukchan Lee <acetcom@gmail.com>
  *
  * This file is part of Open5GS.
  *
@@ -17,27 +17,29 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-#ifndef OGS_PROTO_H
-#define OGS_PROTO_H
+#include <stdio.h>
+#include <stdint.h>
 
-#include "core/ogs-core.h"
+#include "fuzzing.h"
+#include "ogs-proto.h"
 
-#define OGS_PROTO_INSIDE
+#define kMaxInputLength 4096
 
-#include "proto/types.h"
-#include "proto/conv.h"
-#include "proto/event.h"
-#include "proto/timer.h"
-#include "proto/ogs-dhcpv6.h"
+extern int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
+{ /* open5gs/lib/proto/dhcpv6.c */
+    ogs_dhcpv6_message_t message;
+    uint8_t buf[2048];
 
-#undef OGS_PROTO_INSIDE
+    if (Size > kMaxInputLength) {
+        return 1;
+    }
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+    if (!initialized) {
+        initialize();
+    }
 
-#ifdef __cplusplus
+    if (ogs_dhcpv6_parse(&message, Data, Size) == OGS_OK)
+        ogs_dhcpv6_build(&message, buf, sizeof(buf));
+
+    return 0;
 }
-#endif
-
-#endif /* OGS_PROTO_H */
