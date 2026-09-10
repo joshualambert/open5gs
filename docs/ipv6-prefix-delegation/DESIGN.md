@@ -29,14 +29,18 @@ block  = 2001:db8:cafe:1200::/56        (L = 56, the whole thing belongs to this
 link   = 2001:db8:cafe:1200::/64        (first /64 of the block, advertised in the RA / PAA)
 ```
 
-* The link /64 is always the **lowest** /64 of the block. The interface
-  identifier sent to the UE in the PAA / PDU address is unchanged.
+* For dynamically allocated entries the link /64 is the **lowest** /64 of
+  the block. For static entries (see 2.1) it can be any /64 inside the block.
+  The interface identifier sent to the UE in the PAA / PDU address is
+  unchanged.
 * DHCPv6-PD delegates the remainder of the block:
   * client sent `OPTION_PD_EXCLUDE` in its ORO (RFC 6603): one IA Prefix
     `block/L` with `OPTION_PD_EXCLUDE = link/64`.
-  * otherwise (RFC 3633 fallback): one IA Prefix covering the **upper half**
-    of the block, `block + 2^(63-L) ... /(L+1)`, which by construction does
-    not contain the link /64. Example: `2001:db8:cafe:1280::/57`.
+  * otherwise (RFC 3633 fallback): one IA Prefix `/(L+1)` covering the
+    **half of the block that does not contain the link /64** (for dynamic
+    entries that is always the upper half, `block + 2^(63-L)`). Example:
+    `2001:db8:cafe:1280::/57` for block `2001:db8:cafe:1200::/56` with link
+    `2001:db8:cafe:1200::/64`.
 * The block is released with the session; the DHCPv6 binding never outlives
   the PDN connection. Nothing needs a timer on the server side.
 * Pool arithmetic is done on the 64-bit prefix as an integer; entry `i` of
@@ -44,6 +48,30 @@ link   = 2001:db8:cafe:1200::/64        (first /64 of the block, advertised in t
   address or the configured gateway are skipped. `range:` low/high are
   aligned to block boundaries (low up, high down).
 * `prefix_delegation` absent or `0` ⇒ `L = 64` ⇒ exactly today's behaviour.
+
+### 2.1 Static delegated prefixes (per subscriber)
+
+A subscriber with a static UE IPv6 address (WebUI "UE IPv6 Address",
+`session.ue.ipv6` in MongoDB, delivered today via S6a to the MME → PAA →
+SMF for 4G and via Nudm `staticIpAddress` for 5G) keeps today's behaviour
+for the link /64 and additionally gets a **static delegated prefix**:
+
+```
+static address  2001:db8:cafe:4200::1        (pool prefix_delegation: 56)
+link /64        2001:db8:cafe:4200::/64
+block           2001:db8:cafe:4200::/56      = address masked to L, never changes
+```
+
+* The block is derived by masking the static address to the subnet's
+  `prefix_delegation` length; nothing new has to be stored per subscriber
+  and the prefix is identical on every re-attach.
+* Static blocks must not overlap the dynamic pool: operators keep the dynamic
+  `range:` away from the static blocks (same rule as for static IPv4 today).
+  As a safety net the UPF rejects a session whose block is already owned by
+  another session (extension of `upf_sess_ue_ip_conflict()`), and the SMF
+  logs an error if a static link /64 is already in use.
+* The link /64 of a static entry may sit anywhere in the block, hence the
+  "half not containing the link /64" fallback rule above.
 
 Capacity: a `/48` pool gives 65 536 sessions at L=64, 256 at L=56, 4 096 at
 L=60. Operators wanting PD at scale should configure e.g. a `/40`.
