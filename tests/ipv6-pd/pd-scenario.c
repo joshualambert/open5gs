@@ -729,7 +729,9 @@ void pd_check_distinct_blocks(pd_ctx_t *a, pd_ctx_t *b)
     if (a->ia_pd.num_of_prefix && b->ia_pd.num_of_prefix) {
         addr6_str(a->ia_pd.prefix[0].prefix, sa);
         addr6_str(b->ia_pd.prefix[0].prefix, sb);
-        ABTS_STR_NEQUAL(tc, sa, sb, INET6_ADDRSTRLEN);
+        /* ABTS_STR_NEQUAL is strncmp-based (asserts equal); the two
+         * delegated prefixes must differ, so compare explicitly */
+        ABTS_TRUE(tc, strncmp(sa, sb, INET6_ADDRSTRLEN) != 0);
     } else {
         ABTS_FAIL(tc, "Both UEs need a delegated prefix");
     }

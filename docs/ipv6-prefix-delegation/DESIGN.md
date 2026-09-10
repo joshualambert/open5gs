@@ -238,7 +238,8 @@ ignored by the parser.
 Other SMF changes:
 
 * `up2cp` PDR gets a second SDF filter:
-  `permit out 17 from ff02::1:2/128 547 to assigned` (multicast DHCPv6) in
+  `permit out 17 from any 547 to assigned` (uplink DHCPv6, both the
+  ff02::1:2 multicast case and a unicast Renew/Release to the server) in
   addition to the existing ICMPv6 RS rule (gx-handler.c, npcf-handler.c).
 * UE IP Address IE in DL and UL PDRs carries `IPv6D` + delegation bits when
   the session block is shorter than /64.

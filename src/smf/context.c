@@ -2341,8 +2341,16 @@ void smf_sess_set_up2cp_flow_description(smf_sess_t *sess)
     static const char *description[] = {
         /* ICMPv6 Router Solicitation */
         "permit out 58 from ff02::2/128 to assigned",
-        /* DHCPv6 to All_DHCP_Relay_Agents_and_Servers (RFC 8415) */
-        "permit out 17 from ff02::1:2/128 547 to assigned",
+        /*
+         * DHCPv6 from the UE to the server (RFC 8415). A conformant client
+         * multicasts to All_DHCP_Relay_Agents_and_Servers (ff02::1:2), but
+         * because we never send OPTION_UNICAST a client may also unicast a
+         * Renew/Release to the server address; RFC 8415 section 18.4
+         * requires the server to answer such a message with UseMulticast.
+         * Matching every uplink packet with destination port 547 (the SMF
+         * is the only DHCPv6 server the UE can reach) covers both cases.
+         */
+        "permit out 17 from any 547 to assigned",
     };
     size_t i;
 
