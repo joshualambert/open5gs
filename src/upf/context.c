@@ -63,6 +63,9 @@ void upf_context_init(void)
     ogs_assert(self.ipv4_hash);
     self.ipv6_hash = ogs_hash_make();
     ogs_assert(self.ipv6_hash);
+    self.ipv6_pd_hash = ogs_hash_make();
+    ogs_assert(self.ipv6_pd_hash);
+    memset(self.ipv6_pd_len_refcnt, 0, sizeof(self.ipv6_pd_len_refcnt));
 
     context_initialized = 1;
 }
@@ -92,6 +95,8 @@ void upf_context_final(void)
     ogs_hash_destroy(self.ipv4_hash);
     ogs_assert(self.ipv6_hash);
     ogs_hash_destroy(self.ipv6_hash);
+    ogs_assert(self.ipv6_pd_hash);
+    ogs_hash_destroy(self.ipv6_pd_hash);
 
     free_upf_route_trie_node(self.ipv4_framed_routes);
     free_upf_route_trie_node(self.ipv6_framed_routes);
@@ -121,9 +126,18 @@ static void upf_sess_clear_ue_ip(upf_sess_t *sess)
         ogs_hash_unset_if_owner(self.ipv6_hash,
                 sess->ipv6->addr,
                 OGS_IPV6_DEFAULT_PREFIX_LEN >> 3, sess);
+        if (sess->ipv6_prefixlen < OGS_IPV6_DEFAULT_PREFIX_LEN) {
+            ogs_assert(sess->ipv6_prefixlen > 0);
+            if (ogs_hash_unset_if_owner(self.ipv6_pd_hash,
+                    sess->ipv6_pd_key, sizeof(sess->ipv6_pd_key), sess)) {
+                ogs_assert(self.ipv6_pd_len_refcnt[sess->ipv6_prefixlen] > 0);
+                self.ipv6_pd_len_refcnt[sess->ipv6_prefixlen]--;
+            }
+        }
         ogs_pfcp_ue_ip_free(sess->ipv6);
         sess->ipv6 = NULL;
     }
+    sess->ipv6_prefixlen = OGS_IPV6_DEFAULT_PREFIX_LEN;
 }
 
 static int upf_context_prepare(void)
@@ -203,6 +217,8 @@ upf_sess_t *upf_sess_add(ogs_pfcp_f_seid_t *cp_f_seid)
     }
 
     ogs_pfcp_pool_init(&sess->pfcp);
+
+    sess->ipv6_prefixlen = OGS_IPV6_DEFAULT_PREFIX_LEN;
 
     /* Set UPF-N4-SEID */
     ogs_pool_alloc(&upf_n4_seid_pool, &sess->upf_n4_seid_node);
@@ -342,11 +358,29 @@ upf_sess_t *upf_sess_find_by_ipv6(uint32_t *addr6)
     const int chunk_size = sizeof(*addr6) << 3;
 
     ogs_assert(self.ipv6_hash);
+    ogs_assert(self.ipv6_pd_hash);
     ogs_assert(addr6);
     ret = ogs_hash_get(
             self.ipv6_hash, addr6, OGS_IPV6_DEFAULT_PREFIX_LEN >> 3);
     if (ret)
         return ret;
+
+    /*
+     * Delegated network prefixes (blocks) shorter than /64, longest match
+     * first. Only the lengths with at least one registered block are probed,
+     * so sessions without prefix delegation pay nothing here.
+     */
+    for (i = OGS_IPV6_DEFAULT_PREFIX_LEN - 1; i > 0; i--) {
+        uint8_t key[UPF_IPV6_PD_KEY_LEN];
+
+        if (!self.ipv6_pd_len_refcnt[i])
+            continue;
+
+        upf_ipv6_pd_key(key, addr6, i);
+        ret = ogs_hash_get(self.ipv6_pd_hash, key, sizeof(key));
+        if (ret)
+            return ret;
+    }
 
     for (i = 0; i <= OGS_IPV6_128_PREFIX_LEN; i++) {
         int part = i / chunk_size;
@@ -435,6 +469,143 @@ static upf_sess_t *upf_sess_ue_ip_conflict(
     return owner;
 }
 
+/*
+ * Returns the session (other than sess) whose delegated block already covers
+ * the block of ue_ip/prefixlen, or NULL if sess may use it. The session that
+ * holds the link /64 itself is not reported: upf_sess_ue_ip_conflict() has
+ * already decided whether that address may be taken over, and a takeover
+ * of the address is also a takeover of its block.
+ *
+ * This is the safety net for static delegated prefixes overlapping the
+ * dynamic pool (or each other): the block is identical on every re-attach,
+ * so two different sessions claiming it is always a configuration error.
+ */
+static upf_sess_t *upf_sess_ipv6_block_conflict(
+        upf_sess_t *sess, ogs_pfcp_ue_ip_t *ue_ip, uint8_t prefixlen)
+{
+    uint8_t key[UPF_IPV6_PD_KEY_LEN];
+    upf_sess_t *addr_owner = NULL;
+    upf_sess_t *block_owner = NULL;
+
+    ogs_assert(sess);
+    ogs_assert(ue_ip);
+
+    if (prefixlen >= OGS_IPV6_DEFAULT_PREFIX_LEN)
+        return NULL;
+
+    upf_ipv6_pd_key(key, ue_ip->addr, prefixlen);
+    block_owner = ogs_hash_get(self.ipv6_pd_hash, key, sizeof(key));
+    if (!block_owner || block_owner == sess)
+        return NULL;
+
+    addr_owner = ogs_hash_get(self.ipv6_hash, ue_ip->addr,
+            OGS_IPV6_DEFAULT_PREFIX_LEN >> 3);
+    if (block_owner == addr_owner)
+        return NULL;
+
+    return block_owner;
+}
+
+/*
+ * Allocates sess->ipv6 from the UE IP Address IE of pdr (addr6 is the IE's
+ * IPv6 address, all-zero when the UPF has to allocate it), determines the
+ * block length, checks for conflicts and registers the address and, when
+ * shorter than /64, the block. On failure sess->ipv6 is left NULL.
+ */
+static uint8_t upf_sess_set_ue_ipv6(
+        upf_sess_t *sess, ogs_pfcp_pdr_t *pdr, uint8_t *addr6)
+{
+    ogs_pfcp_ue_ip_addr_t *ue_ip = NULL;
+    upf_sess_t *owner = NULL;
+    uint8_t prefixlen = 0;
+    uint32_t block[4];
+    char buf[OGS_ADDRSTRLEN];
+
+    uint8_t cause_value = OGS_PFCP_CAUSE_REQUEST_ACCEPTED;
+
+    ogs_assert(sess);
+    ogs_assert(pdr);
+    ogs_assert(addr6);
+    ue_ip = &pdr->ue_ip_addr;
+
+    /* IPv6D + IPv6 Prefix Delegation Bits (TS 29.244 8.2.62) */
+    prefixlen = ogs_pfcp_ue_ip_addr_ipv6_prefixlen(
+            ue_ip, pdr->ue_ip_addr_len);
+    if (!prefixlen) {
+        ogs_error("Invalid IPv6 Prefix Delegation in UE IP Address "
+                "[IPv6D:%d len:%d]", ue_ip->ipv6d, pdr->ue_ip_addr_len);
+        return OGS_PFCP_CAUSE_MANDATORY_IE_INCORRECT;
+    }
+
+    sess->ipv6 = ogs_pfcp_ue_ip_alloc(&cause_value, AF_INET6,
+                    pdr->dnn, addr6);
+    if (!sess->ipv6) {
+        ogs_error("ogs_pfcp_ue_ip_alloc() failed[%d]", cause_value);
+        ogs_assert(cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED);
+        return cause_value;
+    }
+
+    /*
+     * Without IPv6D, an address taken from the UPF's own pool gets the
+     * block length of that pool (prefix_delegation in upf.yaml); an address
+     * chosen by the SMF stays a /64 unless the IE says otherwise.
+     */
+    if (!ue_ip->ipv6d && !sess->ipv6->static_ip)
+        prefixlen = ogs_pfcp_ue_ip_prefixlen(sess->ipv6);
+
+    owner = upf_sess_ue_ip_conflict(sess, AF_INET6, sess->ipv6);
+    if (owner) {
+        ogs_error("UE IPv6[%s] is owned by another PFCP node "
+                "F-SEID[UP:0x%lx CP:0x%lx]",
+                OGS_INET6_NTOP(&sess->ipv6->addr, buf),
+                (long)owner->upf_n4_seid,
+                (long)owner->smf_n4_f_seid.seid);
+        goto conflict;
+    }
+
+    owner = upf_sess_ipv6_block_conflict(sess, sess->ipv6, prefixlen);
+    if (owner) {
+        memset(block, 0, sizeof(block));
+        upf_ipv6_pd_key(sess->ipv6_pd_key, sess->ipv6->addr, prefixlen);
+        memcpy(block, sess->ipv6_pd_key, OGS_IPV6_DEFAULT_PREFIX_LEN >> 3);
+        ogs_error("UE IPv6 block[%s/%d] is owned by another session "
+                "F-SEID[UP:0x%lx CP:0x%lx]",
+                OGS_INET6_NTOP(block, buf), prefixlen,
+                (long)owner->upf_n4_seid,
+                (long)owner->smf_n4_f_seid.seid);
+        goto conflict;
+    }
+
+    ogs_hash_set(self.ipv6_hash, sess->ipv6->addr,
+            OGS_IPV6_DEFAULT_PREFIX_LEN >> 3, sess);
+
+    sess->ipv6_prefixlen = prefixlen;
+    if (prefixlen < OGS_IPV6_DEFAULT_PREFIX_LEN) {
+        upf_ipv6_pd_key(sess->ipv6_pd_key, sess->ipv6->addr, prefixlen);
+        /*
+         * ipv6_pd_len_refcnt counts hash entries. On a takeover (same PFCP
+         * node re-using the block of an orphaned session) the old entry is
+         * removed first so that the table never keeps a pointer to the key
+         * of a session that is later freed, and the count stays at one.
+         */
+        if (ogs_hash_get(self.ipv6_pd_hash,
+                    sess->ipv6_pd_key, sizeof(sess->ipv6_pd_key)))
+            ogs_hash_set(self.ipv6_pd_hash,
+                    sess->ipv6_pd_key, sizeof(sess->ipv6_pd_key), NULL);
+        else
+            self.ipv6_pd_len_refcnt[prefixlen]++;
+        ogs_hash_set(self.ipv6_pd_hash,
+                sess->ipv6_pd_key, sizeof(sess->ipv6_pd_key), sess);
+    }
+
+    return OGS_PFCP_CAUSE_REQUEST_ACCEPTED;
+
+conflict:
+    ogs_pfcp_ue_ip_free(sess->ipv6);
+    sess->ipv6 = NULL;
+    return OGS_PFCP_CAUSE_REQUEST_REJECTED;
+}
+
 uint8_t upf_sess_set_ue_ip(upf_sess_t *sess,
         uint8_t session_type, ogs_pfcp_pdr_t *pdr)
 {
@@ -442,6 +613,7 @@ uint8_t upf_sess_set_ue_ip(upf_sess_t *sess,
     upf_sess_t *owner = NULL;
     char buf1[OGS_ADDRSTRLEN];
     char buf2[OGS_ADDRSTRLEN];
+    char pd[8];
 
     uint8_t cause_value = OGS_PFCP_CAUSE_REQUEST_ACCEPTED;
 
@@ -483,26 +655,9 @@ uint8_t upf_sess_set_ue_ip(upf_sess_t *sess,
         }
     } else if (session_type == OGS_PDU_SESSION_TYPE_IPV6) {
         if (ue_ip->ipv6 || pdr->dnn) {
-            sess->ipv6 = ogs_pfcp_ue_ip_alloc(&cause_value, AF_INET6,
-                            pdr->dnn, ue_ip->addr6);
-            if (!sess->ipv6) {
-                ogs_error("ogs_pfcp_ue_ip_alloc() failed[%d]", cause_value);
-                ogs_assert(cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED);
+            cause_value = upf_sess_set_ue_ipv6(sess, pdr, ue_ip->addr6);
+            if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED)
                 return cause_value;
-            }
-            owner = upf_sess_ue_ip_conflict(sess, AF_INET6, sess->ipv6);
-            if (owner) {
-                ogs_error("UE IPv6[%s] is owned by another PFCP node "
-                        "F-SEID[UP:0x%lx CP:0x%lx]",
-                        OGS_INET6_NTOP(&sess->ipv6->addr, buf2),
-                        (long)owner->upf_n4_seid,
-                        (long)owner->smf_n4_f_seid.seid);
-                ogs_pfcp_ue_ip_free(sess->ipv6);
-                sess->ipv6 = NULL;
-                return OGS_PFCP_CAUSE_REQUEST_REJECTED;
-            }
-            ogs_hash_set(self.ipv6_hash, sess->ipv6->addr,
-                    OGS_IPV6_DEFAULT_PREFIX_LEN >> 3, sess);
         } else {
             ogs_warn("Cannot support PDN-Type[%d], [IPv4:%d IPv6:%d DNN:%s]",
                 session_type, ue_ip->ipv4, ue_ip->ipv6,
@@ -537,29 +692,12 @@ uint8_t upf_sess_set_ue_ip(upf_sess_t *sess,
         }
 
         if (ue_ip->ipv6 || pdr->dnn) {
-            sess->ipv6 = ogs_pfcp_ue_ip_alloc(&cause_value, AF_INET6,
-                            pdr->dnn, ue_ip->both.addr6);
-            if (!sess->ipv6) {
-                ogs_error("ogs_pfcp_ue_ip_alloc() failed[%d]", cause_value);
-                ogs_assert(cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED);
+            cause_value = upf_sess_set_ue_ipv6(sess, pdr, ue_ip->both.addr6);
+            if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED) {
+                /* Release the IPv4 address installed above */
                 upf_sess_clear_ue_ip(sess);
                 return cause_value;
             }
-            owner = upf_sess_ue_ip_conflict(sess, AF_INET6, sess->ipv6);
-            if (owner) {
-                ogs_error("UE IPv6[%s] is owned by another PFCP node "
-                        "F-SEID[UP:0x%lx CP:0x%lx]",
-                        OGS_INET6_NTOP(&sess->ipv6->addr, buf2),
-                        (long)owner->upf_n4_seid,
-                        (long)owner->smf_n4_f_seid.seid);
-                ogs_pfcp_ue_ip_free(sess->ipv6);
-                sess->ipv6 = NULL;
-                /* Release the IPv4 address installed above */
-                upf_sess_clear_ue_ip(sess);
-                return OGS_PFCP_CAUSE_REQUEST_REJECTED;
-            }
-            ogs_hash_set(self.ipv6_hash, sess->ipv6->addr,
-                    OGS_IPV6_DEFAULT_PREFIX_LEN >> 3, sess);
         } else {
             ogs_warn("Cannot support PDN-Type[%d], [IPv4:%d IPv6:%d DNN:%s]",
                 session_type, ue_ip->ipv4, ue_ip->ipv6,
@@ -572,12 +710,17 @@ uint8_t upf_sess_set_ue_ip(upf_sess_t *sess,
         return OGS_PFCP_CAUSE_SERVICE_NOT_SUPPORTED;
     }
 
+    /* Only a delegated block (shorter than /64) is shown in the log */
+    pd[0] = 0;
+    if (sess->ipv6 && sess->ipv6_prefixlen < OGS_IPV6_DEFAULT_PREFIX_LEN)
+        ogs_snprintf(pd, sizeof(pd), "/%d", sess->ipv6_prefixlen);
+
     ogs_info("UE F-SEID[UP:0x%lx CP:0x%lx] "
-             "APN[%s] PDN-Type[%d] IPv4[%s] IPv6[%s]",
+             "APN[%s] PDN-Type[%d] IPv4[%s] IPv6[%s%s]",
         (long)sess->upf_n4_seid, (long)sess->smf_n4_f_seid.seid,
         pdr->dnn, session_type,
         sess->ipv4 ? OGS_INET_NTOP(&sess->ipv4->addr, buf1) : "",
-        sess->ipv6 ? OGS_INET6_NTOP(&sess->ipv6->addr, buf2) : "");
+        sess->ipv6 ? OGS_INET6_NTOP(&sess->ipv6->addr, buf2) : "", pd);
 
     return cause_value;
 }

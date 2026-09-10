@@ -47,12 +47,75 @@ extern int __upf_log_domain;
 
 struct upf_route_trie_node;
 
+/*
+ * IPv6 prefix helpers (pure, shared by the session table and the uplink
+ * source check). The upper 64 bits of an IPv6 address are handled as one
+ * host-order integer so that a prefix of length 1..64 is a single mask:
+ *
+ *   prefixlen   upf_ipv6_prefix_mask64()
+ *   ---------   ------------------------
+ *   64          0xffffffffffffffff   (exactly the /64 link prefix)
+ *   60          0xfffffffffffffff0
+ *   56          0xffffffffffffff00
+ *   48          0xffffffffffff0000
+ *   1           0x8000000000000000
+ *
+ * prefixlen 0 is not a valid input (shift by 64 is undefined); callers
+ * validate the length before it is stored in upf_sess_t.ipv6_prefixlen.
+ */
+#define UPF_IPV6_PD_KEY_LEN 9
+#define upf_ipv6_prefix_mask64(prefixlen) \
+    (~UINT64_C(0) << (OGS_IPV6_DEFAULT_PREFIX_LEN - (prefixlen)))
+
+OGS_STATIC_ASSERT(upf_ipv6_prefix_mask64(64) == UINT64_C(0xffffffffffffffff));
+OGS_STATIC_ASSERT(upf_ipv6_prefix_mask64(60) == UINT64_C(0xfffffffffffffff0));
+OGS_STATIC_ASSERT(upf_ipv6_prefix_mask64(56) == UINT64_C(0xffffffffffffff00));
+OGS_STATIC_ASSERT(upf_ipv6_prefix_mask64(48) == UINT64_C(0xffffffffffff0000));
+OGS_STATIC_ASSERT(upf_ipv6_prefix_mask64(1) == UINT64_C(0x8000000000000000));
+
+/* Upper 64 bits (network prefix part) of an IPv6 address in host order */
+static inline uint64_t upf_ipv6_prefix64(const uint32_t *addr6)
+{
+    return ((uint64_t)be32toh(addr6[0]) << 32) | be32toh(addr6[1]);
+}
+
+/* true when the first prefixlen (1..64) bits of addr6 and prefix6 match */
+static inline bool upf_ipv6_prefix_match(
+        const uint32_t *addr6, const uint32_t *prefix6, uint8_t prefixlen)
+{
+    return ((upf_ipv6_prefix64(addr6) ^ upf_ipv6_prefix64(prefix6)) &
+            upf_ipv6_prefix_mask64(prefixlen)) == 0;
+}
+
+/* Key of upf_context_t.ipv6_pd_hash for the block of addr6/prefixlen */
+static inline void upf_ipv6_pd_key(
+        uint8_t key[UPF_IPV6_PD_KEY_LEN],
+        const uint32_t *addr6, uint8_t prefixlen)
+{
+    uint64_t prefix = htobe64(
+            upf_ipv6_prefix64(addr6) & upf_ipv6_prefix_mask64(prefixlen));
+
+    memcpy(key, &prefix, sizeof(prefix));
+    key[sizeof(prefix)] = prefixlen;
+}
+
 typedef struct upf_context_s {
     ogs_hash_t *upf_n4_seid_hash;   /* hash table (UPF-N4-SEID) */
     ogs_hash_t *smf_n4_seid_hash;   /* hash table (SMF-N4-SEID) */
     ogs_hash_t *smf_n4_f_seid_hash; /* hash table (SMF-N4-F-SEID) */
     ogs_hash_t *ipv4_hash;  /* hash table (IPv4 Address) */
     ogs_hash_t *ipv6_hash;  /* hash table (IPv6 Address) */
+
+    /*
+     * IPv6 prefix delegation (DHCPv6-PD):
+     * hash table of the network prefixes ("blocks") shorter than /64,
+     * keyed by upf_ipv6_pd_key() = { 8 bytes of the address masked to the
+     * block length, block length }. ipv6_pd_len_refcnt[L] counts the
+     * entries of length L so that upf_sess_find_by_ipv6() only probes the
+     * lengths actually in use.
+     */
+    ogs_hash_t *ipv6_pd_hash;
+    int ipv6_pd_len_refcnt[OGS_IPV6_DEFAULT_PREFIX_LEN + 1];
 
     /* IPv4 framed routes trie */
     struct upf_route_trie_node *ipv4_framed_routes;
@@ -114,6 +177,16 @@ typedef struct upf_sess_s {
     /* APN Configuration */
     ogs_pfcp_ue_ip_t *ipv4;
     ogs_pfcp_ue_ip_t *ipv6;
+    /*
+     * Length of the IPv6 network prefix ("block") owned by the session:
+     * OGS_IPV6_DEFAULT_PREFIX_LEN (64) unless the UE IP Address IE carried
+     * IPv6D or the UPF pool is configured with prefix_delegation.
+     * ipv6->addr[0..1] masked to ipv6_prefixlen is the block.
+     */
+    uint8_t          ipv6_prefixlen;
+    /* Key of this session's entry in upf_context_t.ipv6_pd_hash
+     * (the hash table keeps a pointer to the key, not a copy) */
+    uint8_t          ipv6_pd_key[UPF_IPV6_PD_KEY_LEN];
 
     ogs_ipsubnet_t   *ipv4_framed_routes;
     ogs_ipsubnet_t   *ipv6_framed_routes;

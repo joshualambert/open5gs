@@ -694,20 +694,26 @@ static void _gtpv1_u_recv_one(ogs_socket_t fd, ogs_sock_t *sock, ogs_pkbuf_t *pk
      *
      *  - If the IP source address is the unspecified address, there is no
      *    source link-layer address option in the message.
+     *
+     *
+     * Link-local sources (fe80::/10) are accepted without checking the
+     * interface identifier. Such packets (Router Solicitation, DHCPv6 to
+     * ff02::1:2, ...) either reach the SMF through the UP2CP PDR or,
+     * when forwarded towards N6, are dropped by the kernel because a
+     * link-local address must not be forwarded off-link (RFC 4291 2.5.6).
+     * A CPE / router behind the UE (the DHCPv6-PD requesting router) does
+     * not necessarily use the interface identifier that was assigned in
+     * the attach/registration procedure.
+     *
+     * Global sources must lie inside the session's network prefix: the
+     * /64 link prefix, or the whole delegated block (sess->ipv6_prefixlen
+     * < 64) when IPv6 prefix delegation is in use.
      */
-                if (IN6_IS_ADDR_LINKLOCAL((struct in6_addr *)src_addr) &&
-                    src_addr[2] == sess->ipv6->addr[2] &&
-                    src_addr[3] == sess->ipv6->addr[3]) {
-                    /*
-                     * if Link-local address,
-                     * Interface Identifier should be matched
-                     */
-                } else if (src_addr[0] == sess->ipv6->addr[0] &&
-                            src_addr[1] == sess->ipv6->addr[1]) {
-                    /*
-                     * If Global address
-                     * 64 bit prefix should be matched
-                     */
+                if (IN6_IS_ADDR_LINKLOCAL((struct in6_addr *)src_addr)) {
+                    /* Link-local address, see above */
+                } else if (upf_ipv6_prefix_match(src_addr,
+                            sess->ipv6->addr, sess->ipv6_prefixlen)) {
+                    /* Global address inside the /64 or delegated block */
                 } else if (check_framed_routes(sess, AF_INET6, src_addr)) {
                     /* Or source IP address should match a framed route */
                 } else {
@@ -716,11 +722,12 @@ static void _gtpv1_u_recv_one(ogs_socket_t fd, ogs_sock_t *sock, ogs_pkbuf_t *pk
                     ogs_error("SRC:%08x %08x %08x %08x",
                             be32toh(src_addr[0]), be32toh(src_addr[1]),
                             be32toh(src_addr[2]), be32toh(src_addr[3]));
-                    ogs_error("UE:%08x %08x %08x %08x",
+                    ogs_error("UE:%08x %08x %08x %08x/%d",
                             be32toh(sess->ipv6->addr[0]),
                             be32toh(sess->ipv6->addr[1]),
                             be32toh(sess->ipv6->addr[2]),
-                            be32toh(sess->ipv6->addr[3]));
+                            be32toh(sess->ipv6->addr[3]),
+                            sess->ipv6_prefixlen);
                     ogs_log_hexdump(OGS_LOG_ERROR, pkbuf->data, pkbuf->len);
 
                     goto cleanup;
@@ -772,6 +779,9 @@ static void _gtpv1_u_recv_one(ogs_socket_t fd, ogs_sock_t *sock, ogs_pkbuf_t *pk
              * (sess->ipv4->subnet or sess->ipv6->subnet).
              * A cheap subnet check gates the session lookup so that
              * normal internet traffic does not touch the hash table.
+             * The check uses the configured subnet (e.g. /48), so it also
+             * covers destinations inside another session's delegated
+             * IPv6 block; upf_sess_find_by_ipv6() resolves those.
              */
             if (ip_h->ip_v == 4 && subnet->family == AF_INET) {
                 if (ogs_unlikely(
