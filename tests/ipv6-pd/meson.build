@@ -1,4 +1,4 @@
-# Copyright (C) 2019 by Sukchan Lee <acetcom@gmail.com>
+# Copyright (C) 2026 by Josh Lambert <josh.lambert@alabamalightwave.com>
 
 # This file is part of Open5GS.
 
@@ -15,24 +15,18 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-testinc = include_directories('.')
+testapp_ipv6_pd_sources = files('''
+    abts-main.c
+    pd-scenario.c
+    epc-test.c
+    5gc-test.c
+'''.split())
 
-subdir('core')
-subdir('crypt')
-subdir('sctp')
-subdir('unit')
-subdir('af')
-subdir('common')
-subdir('app')
-subdir('registration')
-subdir('vonr')
-subdir('slice')
-subdir('attach')
-subdir('dns')
-subdir('volte')
-subdir('csfb')
-subdir('310014')
-subdir('handover')
-subdir('ipv6-pd')
-subdir('non3gpp')
-subdir('transfer')
+testapp_ipv6_pd_exe = executable('ipv6-pd',
+    sources : testapp_ipv6_pd_sources,
+    c_args : testunit_core_cc_flags,
+    dependencies : libtestapp_dep)
+
+# Many scenarios wait up to 3 s per missing reply; allow for a slow CI.
+test('ipv6-pd', testapp_ipv6_pd_exe,
+    is_parallel : false, suite: 'app', timeout : 300)

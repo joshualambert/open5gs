@@ -43,6 +43,7 @@ example_conf = '''
     non3gpp.yaml
     transfer.yaml
     transfer-error-case.yaml
+    ipv6-pd.yaml
 '''.split()
 
 foreach file : example_conf

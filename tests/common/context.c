@@ -1580,11 +1580,51 @@ int test_db_remove_ue(test_ue_t *test_ue)
     return OGS_OK;
 }
 
-bson_t *test_db_new_simple(test_ue_t *test_ue)
+static bson_t *db_new_session_doc(int session_type, const char *static_ipv6)
 {
     bson_t *doc = NULL;
 
+    doc = BCON_NEW(
+            "name", BCON_UTF8("internet"),
+            "type", BCON_INT32(session_type),
+            "ambr", "{",
+                "downlink", "{",
+                    "value", BCON_INT32(1),
+                    "unit", BCON_INT32(3),
+                "}",
+                "uplink", "{",
+                    "value", BCON_INT32(1),
+                    "unit", BCON_INT32(3),
+                "}",
+            "}",
+            "qos", "{",
+                "index", BCON_INT32(9),
+                "arp", "{",
+                    "priority_level", BCON_INT32(8),
+                    "pre_emption_vulnerability", BCON_INT32(1),
+                    "pre_emption_capability", BCON_INT32(1),
+                "}",
+            "}",
+            "lbo_roaming_allowed", BCON_BOOL(false)
+          );
+    ogs_assert(doc);
+
+    if (static_ipv6)
+        BCON_APPEND(doc, "ue", "{", "ipv6", BCON_UTF8(static_ipv6), "}");
+
+    return doc;
+}
+
+static bson_t *db_new_simple(
+        test_ue_t *test_ue, int session_type, const char *static_ipv6)
+{
+    bson_t *doc = NULL;
+    bson_t *session = NULL;
+
     ogs_assert(test_ue);
+
+    session = db_new_session_doc(session_type, static_ipv6);
+    ogs_assert(session);
 
     doc = BCON_NEW(
             "imsi", BCON_UTF8(test_ue->imsi),
@@ -1605,38 +1645,7 @@ bson_t *test_db_new_simple(test_ue_t *test_ue)
             "slice", "[", "{",
                 "sst", BCON_INT32(1),
                 "default_indicator", BCON_BOOL(true),
-                "session", "[", "{",
-                    "name", BCON_UTF8("internet"),
-                    "type", BCON_INT32(3),
-                    "ambr", "{",
-                        "downlink", "{",
-                            "value", BCON_INT32(1),
-                            "unit", BCON_INT32(3),
-                        "}",
-                        "uplink", "{",
-                            "value", BCON_INT32(1),
-                            "unit", BCON_INT32(3),
-                        "}",
-                    "}",
-#if 0 /* For static-IP test */
-                    "ue", "{", "ipv4", "1.1.1.1", "ipv6", "::1", "}",
-                    "ue", "{", "ipv4", "1.1.1.1", "}",
-                    "ue", "{", "ipv6", "::1", "}",
-#endif
-                    "qos", "{",
-                        "index", BCON_INT32(9),
-                        "arp", "{",
-                            "priority_level", BCON_INT32(8),
-                            "pre_emption_vulnerability", BCON_INT32(1),
-                            "pre_emption_capability", BCON_INT32(1),
-                        "}",
-                    "}",
-#if 0
-                    "lbo_roaming_allowed", BCON_BOOL(true),
-#else
-                    "lbo_roaming_allowed", BCON_BOOL(false),
-#endif
-                "}", "]",
+                "session", "[", BCON_DOCUMENT(session), "]",
             "}", "]",
             "security", "{",
                 "k", BCON_UTF8(test_ue->k_string),
@@ -1652,7 +1661,26 @@ bson_t *test_db_new_simple(test_ue_t *test_ue)
           );
     ogs_assert(doc);
 
+    bson_destroy(session);
+
     return doc;
+}
+
+bson_t *test_db_new_simple(test_ue_t *test_ue)
+{
+    return db_new_simple(test_ue, OGS_PDU_SESSION_TYPE_IPV4V6, NULL);
+}
+
+bson_t *test_db_new_session_type(test_ue_t *test_ue, int session_type)
+{
+    return db_new_simple(test_ue, session_type, NULL);
+}
+
+bson_t *test_db_new_static_ipv6(
+        test_ue_t *test_ue, int session_type, const char *ipv6)
+{
+    ogs_assert(ipv6);
+    return db_new_simple(test_ue, session_type, ipv6);
 }
 
 bson_t *test_db_new_qos_flow(test_ue_t *test_ue)
