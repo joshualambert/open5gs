@@ -39,6 +39,11 @@ smf:
       gateway: 10.45.0.1
     - subnet: 2001:db8:cafe::/48
       gateway: 2001:db8:cafe::1
+# Uncomment to hand every session a /56 network prefix ("block") instead of
+# a single /64: the lowest /64 of the block is the UE link prefix and the rest
+# is delegated to the UE with DHCPv6-PD (RFC 8415). Must be 1..63 and not
+# shorter than the subnet; it reduces the pool to one session per /56.
+#      prefix_delegation: 56
   dns:
     - 8.8.8.8
     - 8.8.4.4

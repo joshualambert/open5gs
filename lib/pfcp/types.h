@@ -699,13 +699,45 @@ ED8(uint8_t     spare:1;,
     uint8_t     ipv6:1;)
     union {
         uint32_t addr;
-        uint8_t addr6[OGS_IPV6_LEN];
+        struct {
+            uint8_t addr6[OGS_IPV6_LEN];
+            uint8_t ipv6_prefix_delegation_bits;
+        } __attribute__ ((packed));
         struct {
             uint32_t addr;
             uint8_t addr6[OGS_IPV6_LEN];
-        } both;
-    };
+            uint8_t ipv6_prefix_delegation_bits;
+        } __attribute__ ((packed)) both;
+    } __attribute__ ((packed));
 } __attribute__ ((packed)) ogs_pfcp_ue_ip_addr_t;
+
+/*
+ * Wire layout of the UE IP Address IE (only the parts whose flag is set
+ * are present, in this order):
+ *
+ *   offset 0            : flags (1 octet)
+ *   offset 1            : IPv4 address (4 octets)          if V4
+ *   offset 1 or 5       : IPv6 address (16 octets)         if V6
+ *   offset 17 or 21     : IPv6 Prefix Delegation Bits (1)  if IPv6D
+ *   next octet          : IPv6 Prefix Length (1)           if IP6PL (unused)
+ *
+ * The IPv6 Prefix Delegation Bits octet is only carried when IPv6D is set;
+ * its position depends on whether an IPv4 address precedes the IPv6
+ * address, hence the two members below. Use
+ * ogs_pfcp_ue_ip_addr_set_ipv6_prefixlen() and
+ * ogs_pfcp_ue_ip_addr_ipv6_prefixlen() to access it together with the IE
+ * length.
+ */
+OGS_STATIC_ASSERT(offsetof(ogs_pfcp_ue_ip_addr_t, addr) == 1);
+OGS_STATIC_ASSERT(offsetof(ogs_pfcp_ue_ip_addr_t, addr6) == 1);
+OGS_STATIC_ASSERT(
+        offsetof(ogs_pfcp_ue_ip_addr_t, ipv6_prefix_delegation_bits) == 17);
+OGS_STATIC_ASSERT(offsetof(ogs_pfcp_ue_ip_addr_t, both.addr) == 1);
+OGS_STATIC_ASSERT(offsetof(ogs_pfcp_ue_ip_addr_t, both.addr6) == 5);
+OGS_STATIC_ASSERT(
+        offsetof(ogs_pfcp_ue_ip_addr_t, both.ipv6_prefix_delegation_bits)
+        == 21);
+OGS_STATIC_ASSERT(sizeof(ogs_pfcp_ue_ip_addr_t) == 22);
 
 /*
  * 8.2.56 Outer Header Creation
