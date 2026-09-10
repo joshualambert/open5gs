@@ -103,8 +103,16 @@ void smf_context_init(void)
     ogs_assert(self.ipv4_hash);
     self.ipv6_hash = ogs_hash_make();
     ogs_assert(self.ipv6_hash);
+    self.ipv6_pd_hash = ogs_hash_make();
+    ogs_assert(self.ipv6_pd_hash);
     self.n1n2message_hash = ogs_hash_make();
     ogs_assert(self.n1n2message_hash);
+
+    /* DHCPv6 prefix delegation defaults; T1/T2 are derived from the
+     * preferred lifetime by smf_dhcpv6_config_finalize() unless set */
+    self.dhcpv6.preferred_lifetime = SMF_DHCPV6_DEFAULT_PREFERRED_LIFETIME;
+    self.dhcpv6.valid_lifetime = SMF_DHCPV6_DEFAULT_VALID_LIFETIME;
+    self.dhcpv6.rapid_commit = true;
 
     context_initialized = 1;
 }
@@ -128,6 +136,8 @@ void smf_context_final(void)
     ogs_hash_destroy(self.ipv4_hash);
     ogs_assert(self.ipv6_hash);
     ogs_hash_destroy(self.ipv6_hash);
+    ogs_assert(self.ipv6_pd_hash);
+    ogs_hash_destroy(self.ipv6_pd_hash);
     ogs_assert(self.n1n2message_hash);
     ogs_hash_destroy(self.n1n2message_hash);
 
@@ -298,8 +308,149 @@ static int smf_context_validation(void)
     return OGS_OK;
 }
 
+/*
+ * DHCPv6 server DUID from smf.yaml: hexadecimal octets, ':' separators
+ * allowed, 3..130 octets (RFC 8415 section 11).
+ */
+static int smf_dhcpv6_parse_duid(const char *v, ogs_dhcpv6_duid_t *duid)
+{
+    char hex[OGS_DHCPV6_MAX_DUID_LEN * 2 + 1];
+    int n = 0, len;
+
+    ogs_assert(v);
+    ogs_assert(duid);
+
+    for (; *v; v++) {
+        if (*v == ':')
+            continue;
+        if (n >= (int)sizeof(hex) - 1) {
+            ogs_error("DHCPv6 DUID longer than %d octets",
+                    OGS_DHCPV6_MAX_DUID_LEN);
+            return OGS_ERROR;
+        }
+        hex[n++] = *v;
+    }
+    hex[n] = 0;
+
+    len = n / 2;
+    if (n % 2 || len < OGS_DHCPV6_MIN_DUID_LEN ||
+        len > OGS_DHCPV6_MAX_DUID_LEN) {
+        ogs_error("DHCPv6 DUID must be %d..%d hexadecimal octets [%s]",
+                OGS_DHCPV6_MIN_DUID_LEN, OGS_DHCPV6_MAX_DUID_LEN, hex);
+        return OGS_ERROR;
+    }
+    if (ogs_ascii_to_hex_checked(hex, n, duid->data, len) != OGS_OK) {
+        ogs_error("DHCPv6 DUID is not hexadecimal [%s]", hex);
+        return OGS_ERROR;
+    }
+    duid->len = len;
+
+    return OGS_OK;
+}
+
+/*
+ * Default server DUID: DUID-UUID (RFC 6355, type 4) whose UUID is the first
+ * 16 octets of SHA-256("open5gs-smf-dhcpv6-duid:" + <first configured PFCP
+ * server address>), with the RFC 4122 version (5) and variant bits set.
+ * The PFCP address is part of the static configuration, so the DUID is
+ * stable across restarts without storing anything.
+ */
+static void smf_dhcpv6_default_duid(ogs_dhcpv6_duid_t *duid)
+{
+    ogs_socknode_t *node = NULL;
+    char addr[OGS_ADDRSTRLEN];
+    char seed[OGS_ADDRSTRLEN + 32];
+    uint8_t digest[OGS_SHA256_DIGEST_SIZE];
+
+    ogs_assert(duid);
+
+    node = ogs_list_first(&ogs_pfcp_self()->pfcp_list);
+    if (!node)
+        node = ogs_list_first(&ogs_pfcp_self()->pfcp_list6);
+
+    ogs_snprintf(seed, sizeof(seed), "open5gs-smf-dhcpv6-duid:%s",
+            (node && node->addr) ? OGS_ADDR(node->addr, addr) : "");
+    ogs_sha256((const uint8_t *)seed, strlen(seed), digest);
+
+    duid->len = 2 + 16;
+    duid->data[0] = 0x00;
+    duid->data[1] = 0x04;                 /* DUID-UUID */
+    memcpy(duid->data + 2, digest, 16);
+    duid->data[2 + 6] = (duid->data[2 + 6] & 0x0f) | 0x50;  /* version 5 */
+    duid->data[2 + 8] = (duid->data[2 + 8] & 0x3f) | 0x80;  /* RFC 4122 */
+}
+
+/* Apply DHCPv6 defaults that depend on other keys and reject nonsense */
+static int smf_dhcpv6_config_finalize(bool t1_set, bool t2_set)
+{
+    char hex[OGS_DHCPV6_MAX_DUID_LEN * 2 + 1];
+
+    if (!self.dhcpv6.duid.len)
+        smf_dhcpv6_default_duid(&self.dhcpv6.duid);
+
+    if (self.dhcpv6.preferred_lifetime == 0) {
+        ogs_error("dhcpv6.preferred_lifetime must be greater than 0");
+        return OGS_ERROR;
+    }
+    if (self.dhcpv6.valid_lifetime < self.dhcpv6.preferred_lifetime) {
+        ogs_error("dhcpv6.valid_lifetime[%u] must not be less than "
+                "dhcpv6.preferred_lifetime[%u]",
+                self.dhcpv6.valid_lifetime, self.dhcpv6.preferred_lifetime);
+        return OGS_ERROR;
+    }
+
+    /* RFC 8415 section 21.21: T1 = 0.5 and T2 = 0.8 of the shortest
+     * preferred lifetime are recommended */
+    if (!t1_set)
+        self.dhcpv6.t1 = self.dhcpv6.preferred_lifetime / 2;
+    if (!t2_set)
+        self.dhcpv6.t2 = self.dhcpv6.preferred_lifetime / 5 * 4;
+
+    /* 0 means "the client decides" and is exempt from the ordering rule */
+    if (self.dhcpv6.t1 && self.dhcpv6.t2 && self.dhcpv6.t1 > self.dhcpv6.t2) {
+        ogs_error("dhcpv6.t1[%u] must not be greater than dhcpv6.t2[%u]",
+                self.dhcpv6.t1, self.dhcpv6.t2);
+        return OGS_ERROR;
+    }
+    if (self.dhcpv6.t1 > self.dhcpv6.valid_lifetime ||
+        self.dhcpv6.t2 > self.dhcpv6.valid_lifetime) {
+        ogs_error("dhcpv6.t1[%u]/t2[%u] must not exceed "
+                "dhcpv6.valid_lifetime[%u]",
+                self.dhcpv6.t1, self.dhcpv6.t2, self.dhcpv6.valid_lifetime);
+        return OGS_ERROR;
+    }
+
+    ogs_info("DHCPv6 server DUID[%s] lifetimes[%u/%u] T1/T2[%u/%u] "
+            "rapid_commit[%d] preference[%u]",
+            (char *)ogs_hex_to_ascii(self.dhcpv6.duid.data,
+                self.dhcpv6.duid.len, hex, sizeof(hex)),
+            self.dhcpv6.preferred_lifetime, self.dhcpv6.valid_lifetime,
+            self.dhcpv6.t1, self.dhcpv6.t2,
+            self.dhcpv6.rapid_commit, self.dhcpv6.preference);
+
+    return OGS_OK;
+}
+
+/* Parse an unsigned 32-bit scalar; false when the value is not a number */
+static bool smf_yaml_iter_uint32(ogs_yaml_iter_t *iter, uint32_t *out)
+{
+    const char *v = ogs_yaml_iter_value(iter);
+    char *end = NULL;
+    unsigned long n;
+
+    if (!v || !*v)
+        return false;
+    n = strtoul(v, &end, 10);
+    if (*end || n > UINT32_MAX)
+        return false;
+    *out = (uint32_t)n;
+
+    return true;
+}
+
 int smf_context_parse_config(void)
 {
+    bool dhcpv6_t1_set = false, dhcpv6_t2_set = false;
     int rv;
     yaml_document_t *document = NULL;
     ogs_yaml_iter_t root_iter;
@@ -550,6 +701,60 @@ int smf_context_parse_config(void)
                             YAML_SCALAR_NODE);
                     self.mtu = atoi(ogs_yaml_iter_value(&smf_iter));
                     ogs_assert(self.mtu);
+                } else if (!strcmp(smf_key, "dhcpv6")) {
+                    ogs_yaml_iter_t dhcpv6_iter;
+                    ogs_yaml_iter_recurse(&smf_iter, &dhcpv6_iter);
+                    while (ogs_yaml_iter_next(&dhcpv6_iter)) {
+                        const char *dhcpv6_key =
+                            ogs_yaml_iter_key(&dhcpv6_iter);
+                        const char *v = ogs_yaml_iter_value(&dhcpv6_iter);
+                        uint32_t n = 0;
+                        ogs_assert(dhcpv6_key);
+                        if (!strcmp(dhcpv6_key, "duid")) {
+                            if (!v || smf_dhcpv6_parse_duid(
+                                        v, &self.dhcpv6.duid) != OGS_OK)
+                                return OGS_ERROR;
+                        } else if (!strcmp(dhcpv6_key,
+                                    "preferred_lifetime")) {
+                            if (!smf_yaml_iter_uint32(&dhcpv6_iter, &n)) {
+                                ogs_error("Invalid dhcpv6.%s", dhcpv6_key);
+                                return OGS_ERROR;
+                            }
+                            self.dhcpv6.preferred_lifetime = n;
+                        } else if (!strcmp(dhcpv6_key, "valid_lifetime")) {
+                            if (!smf_yaml_iter_uint32(&dhcpv6_iter, &n)) {
+                                ogs_error("Invalid dhcpv6.%s", dhcpv6_key);
+                                return OGS_ERROR;
+                            }
+                            self.dhcpv6.valid_lifetime = n;
+                        } else if (!strcmp(dhcpv6_key, "t1")) {
+                            if (!smf_yaml_iter_uint32(&dhcpv6_iter, &n)) {
+                                ogs_error("Invalid dhcpv6.%s", dhcpv6_key);
+                                return OGS_ERROR;
+                            }
+                            self.dhcpv6.t1 = n;
+                            dhcpv6_t1_set = true;
+                        } else if (!strcmp(dhcpv6_key, "t2")) {
+                            if (!smf_yaml_iter_uint32(&dhcpv6_iter, &n)) {
+                                ogs_error("Invalid dhcpv6.%s", dhcpv6_key);
+                                return OGS_ERROR;
+                            }
+                            self.dhcpv6.t2 = n;
+                            dhcpv6_t2_set = true;
+                        } else if (!strcmp(dhcpv6_key, "rapid_commit")) {
+                            self.dhcpv6.rapid_commit =
+                                ogs_yaml_iter_bool(&dhcpv6_iter);
+                        } else if (!strcmp(dhcpv6_key, "preference")) {
+                            if (!smf_yaml_iter_uint32(&dhcpv6_iter, &n) ||
+                                n > UINT8_MAX) {
+                                ogs_error("Invalid dhcpv6.%s (0..255)",
+                                        dhcpv6_key);
+                                return OGS_ERROR;
+                            }
+                            self.dhcpv6.preference = n;
+                        } else
+                            ogs_warn("unknown key `%s`", dhcpv6_key);
+                    }
                 } else if (!strcmp(smf_key, "p-cscf")) {
                     ogs_yaml_iter_t p_cscf_iter;
                     ogs_yaml_iter_recurse(&smf_iter, &p_cscf_iter);
@@ -1013,6 +1218,9 @@ int smf_context_parse_config(void)
     }
 
     rv = smf_context_validation();
+    if (rv != OGS_OK) return rv;
+
+    rv = smf_dhcpv6_config_finalize(dhcpv6_t1_set, dhcpv6_t2_set);
     if (rv != OGS_OK) return rv;
 
     return OGS_OK;
@@ -1876,6 +2084,91 @@ smf_sess_t *smf_sess_add_by_pdu_session(ogs_sbi_message_t *message)
     return sess;
 }
 
+uint8_t smf_sess_ipv6_prefixlen(smf_sess_t *sess)
+{
+    ogs_assert(sess);
+
+    if (!sess->ipv6)
+        return 0;
+
+    return ogs_pfcp_ue_ip_prefixlen(sess->ipv6);
+}
+
+/* Network prefix of `addr6` masked to `prefixlen` (< 64) + length octet */
+static void ipv6_pd_key(uint8_t *key, const uint32_t *addr6, uint8_t prefixlen)
+{
+    uint64_t prefix;
+
+    ogs_assert(key);
+    ogs_assert(addr6);
+    ogs_assert(prefixlen > 0 && prefixlen < OGS_IPV6_DEFAULT_PREFIX_LEN);
+
+    memcpy(&prefix, addr6, sizeof(prefix));
+    prefix = be64toh(prefix) & ~((UINT64_C(1) << (64 - prefixlen)) - 1);
+    prefix = htobe64(prefix);
+    memcpy(key, &prefix, sizeof(prefix));
+    key[sizeof(prefix)] = prefixlen;
+}
+
+/* Forget the session's IPv6 link prefix, its delegated block and the
+ * DHCPv6 binding that was tied to them. Entries are only removed when they
+ * still point to this session: with conflicting static addresses (logged
+ * by sess_ipv6_hash_set()) a later session may own them by now. */
+static void sess_ipv6_hash_unset(smf_sess_t *sess)
+{
+    ogs_assert(sess);
+    ogs_assert(sess->ipv6);
+
+    if (ogs_hash_get(self.ipv6_hash,
+                sess->ipv6->addr, OGS_IPV6_DEFAULT_PREFIX_LEN >> 3) == sess)
+        ogs_hash_set(self.ipv6_hash,
+                sess->ipv6->addr, OGS_IPV6_DEFAULT_PREFIX_LEN >> 3, NULL);
+    if (ogs_pfcp_ue_ip_prefixlen(sess->ipv6) < OGS_IPV6_DEFAULT_PREFIX_LEN &&
+        ogs_hash_get(self.ipv6_pd_hash,
+                sess->ipv6_pd_key, sizeof(sess->ipv6_pd_key)) == sess)
+        ogs_hash_set(self.ipv6_pd_hash,
+                sess->ipv6_pd_key, sizeof(sess->ipv6_pd_key), NULL);
+
+    memset(&sess->dhcpv6, 0, sizeof(sess->dhcpv6));
+}
+
+/* Register the session's IPv6 link prefix and, with prefix delegation,
+ * its whole block. A previous DHCPv6 binding never survives this. */
+static void sess_ipv6_hash_set(smf_sess_t *sess)
+{
+    smf_sess_t *other = NULL;
+    uint8_t prefixlen;
+    char buf[OGS_ADDRSTRLEN];
+
+    ogs_assert(sess);
+    ogs_assert(sess->ipv6);
+
+    other = ogs_hash_get(self.ipv6_hash,
+            sess->ipv6->addr, OGS_IPV6_DEFAULT_PREFIX_LEN >> 3);
+    if (other && other != sess)
+        ogs_error("IPv6 prefix %s/64 (static[%d]) is already in use by "
+                "another session; check the static UE addresses and the "
+                "dynamic range", OGS_INET6_NTOP(sess->ipv6->addr, buf),
+                sess->ipv6->static_ip);
+    ogs_hash_set(self.ipv6_hash,
+            sess->ipv6->addr, OGS_IPV6_DEFAULT_PREFIX_LEN >> 3, sess);
+
+    prefixlen = ogs_pfcp_ue_ip_prefixlen(sess->ipv6);
+    if (prefixlen < OGS_IPV6_DEFAULT_PREFIX_LEN) {
+        ipv6_pd_key(sess->ipv6_pd_key, sess->ipv6->addr, prefixlen);
+        other = ogs_hash_get(self.ipv6_pd_hash,
+                sess->ipv6_pd_key, sizeof(sess->ipv6_pd_key));
+        if (other && other != sess)
+            ogs_error("IPv6 block %s/%d (static[%d]) is already in use by "
+                    "another session", OGS_INET6_NTOP(sess->ipv6->addr, buf),
+                    prefixlen, sess->ipv6->static_ip);
+        ogs_hash_set(self.ipv6_pd_hash,
+                sess->ipv6_pd_key, sizeof(sess->ipv6_pd_key), sess);
+    }
+
+    memset(&sess->dhcpv6, 0, sizeof(sess->dhcpv6));
+}
+
 uint8_t smf_sess_set_ue_ip(smf_sess_t *sess)
 {
     ogs_pfcp_subnet_t *subnet6 = NULL;
@@ -1926,11 +2219,12 @@ uint8_t smf_sess_set_ue_ip(smf_sess_t *sess)
         ogs_hash_set(smf_self()->ipv4_hash,
                 sess->ipv4->addr, OGS_IPV4_LEN, NULL);
         ogs_pfcp_ue_ip_free(sess->ipv4);
+        sess->ipv4 = NULL;
     }
     if (sess->ipv6) {
-        ogs_hash_set(smf_self()->ipv6_hash,
-                sess->ipv6->addr, OGS_IPV6_DEFAULT_PREFIX_LEN >> 3, NULL);
+        sess_ipv6_hash_unset(sess);
         ogs_pfcp_ue_ip_free(sess->ipv6);
+        sess->ipv6 = NULL;
     }
 
     if (sess->session.session_type == OGS_PDU_SESSION_TYPE_IPV4) {
@@ -1956,8 +2250,7 @@ uint8_t smf_sess_set_ue_ip(smf_sess_t *sess)
 
         sess->paa.len = OGS_IPV6_DEFAULT_PREFIX_LEN;
         memcpy(sess->paa.addr6, sess->ipv6->addr, OGS_IPV6_LEN);
-        ogs_hash_set(smf_self()->ipv6_hash,
-                sess->ipv6->addr, OGS_IPV6_DEFAULT_PREFIX_LEN >> 3, sess);
+        sess_ipv6_hash_set(sess);
     } else if (sess->session.session_type == OGS_PDU_SESSION_TYPE_IPV4V6) {
         sess->ipv4 = ogs_pfcp_ue_ip_alloc(&cause_value, AF_INET,
                 sess->session.name, (uint8_t *)&sess->session.ue_ip.addr);
@@ -1987,8 +2280,7 @@ uint8_t smf_sess_set_ue_ip(smf_sess_t *sess)
         memcpy(sess->paa.both.addr6, sess->ipv6->addr, OGS_IPV6_LEN);
         ogs_hash_set(smf_self()->ipv4_hash,
                 sess->ipv4->addr, OGS_IPV4_LEN, sess);
-        ogs_hash_set(smf_self()->ipv6_hash,
-                sess->ipv6->addr, OGS_IPV6_DEFAULT_PREFIX_LEN >> 3, sess);
+        sess_ipv6_hash_set(sess);
     } else {
         ogs_fatal("Invalid sess->session.session_type[%d]",
                 sess->session.session_type);
@@ -2019,6 +2311,55 @@ void smf_sess_set_paging_n1n2message_location(
             sess->paging.n1n2message_location,
             strlen(sess->paging.n1n2message_location),
             sess);
+}
+
+int smf_sess_pdr_set_ue_ip_addr(smf_sess_t *sess, ogs_pfcp_pdr_t *pdr)
+{
+    uint8_t prefixlen;
+
+    ogs_assert(sess);
+    ogs_assert(pdr);
+
+    if (ogs_pfcp_paa_to_ue_ip_addr(&sess->paa,
+                &pdr->ue_ip_addr, &pdr->ue_ip_addr_len) != OGS_OK)
+        return OGS_ERROR;
+
+    /* TS 29.244 8.2.62: IPv6D + IPv6 Prefix Delegation Bits tell the UPF
+     * that the whole block, not only the link /64, belongs to the UE */
+    prefixlen = smf_sess_ipv6_prefixlen(sess);
+    if (pdr->ue_ip_addr.ipv6 &&
+        prefixlen && prefixlen < OGS_IPV6_DEFAULT_PREFIX_LEN)
+        return ogs_pfcp_ue_ip_addr_set_ipv6_prefixlen(
+                &pdr->ue_ip_addr, &pdr->ue_ip_addr_len, prefixlen);
+
+    return OGS_OK;
+}
+
+void smf_sess_set_up2cp_flow_description(smf_sess_t *sess)
+{
+    ogs_pfcp_pdr_t *up2cp_pdr = NULL;
+    static const char *description[] = {
+        /* ICMPv6 Router Solicitation */
+        "permit out 58 from ff02::2/128 to assigned",
+        /* DHCPv6 to All_DHCP_Relay_Agents_and_Servers (RFC 8415) */
+        "permit out 17 from ff02::1:2/128 547 to assigned",
+    };
+    size_t i;
+
+    ogs_assert(sess);
+    up2cp_pdr = sess->up2cp_pdr;
+    ogs_assert(up2cp_pdr);
+
+    /* The UP2CP PDR carries nothing but these fixed filters */
+    ogs_assert(up2cp_pdr->num_of_flow + (int)OGS_ARRAY_SIZE(description) <=
+            OGS_MAX_NUM_OF_FLOW_IN_PDR);
+
+    for (i = 0; i < OGS_ARRAY_SIZE(description); i++) {
+        up2cp_pdr->flow[up2cp_pdr->num_of_flow].fd = 1;
+        up2cp_pdr->flow[up2cp_pdr->num_of_flow].description =
+            (char *)description[i];
+        up2cp_pdr->num_of_flow++;
+    }
 }
 
 void smf_sess_remove(smf_sess_t *sess)
@@ -2068,8 +2409,7 @@ void smf_sess_remove(smf_sess_t *sess)
         ogs_pfcp_ue_ip_free(sess->ipv4);
     }
     if (sess->ipv6) {
-        ogs_hash_set(self.ipv6_hash,
-                sess->ipv6->addr, OGS_IPV6_DEFAULT_PREFIX_LEN >> 3, NULL);
+        sess_ipv6_hash_unset(sess);
         ogs_pfcp_ue_ip_free(sess->ipv6);
     }
 
@@ -2290,10 +2630,30 @@ smf_sess_t *smf_sess_find_by_ipv4(uint32_t addr)
 
 smf_sess_t *smf_sess_find_by_ipv6(uint32_t *addr6)
 {
+    smf_sess_t *sess = NULL;
+    ogs_pfcp_subnet_t *subnet = NULL;
+    uint8_t key[(OGS_IPV6_DEFAULT_PREFIX_LEN >> 3) + 1];
+
     ogs_assert(self.ipv6_hash);
     ogs_assert(addr6);
-    return (smf_sess_t *)ogs_hash_get(
+
+    sess = (smf_sess_t *)ogs_hash_get(
             self.ipv6_hash, addr6, OGS_IPV6_DEFAULT_PREFIX_LEN >> 3);
+    if (sess)
+        return sess;
+
+    /* Not a link /64: the address may sit inside a delegated block. Only
+     * the block lengths configured in some subnet can be in the hash. */
+    ogs_list_for_each(&ogs_pfcp_self()->subnet_list, subnet) {
+        if (subnet->family != AF_INET6 || !subnet->pd_prefixlen)
+            continue;
+        ipv6_pd_key(key, addr6, subnet->pd_prefixlen);
+        sess = (smf_sess_t *)ogs_hash_get(self.ipv6_pd_hash, key, sizeof(key));
+        if (sess)
+            return sess;
+    }
+
+    return NULL;
 }
 
 smf_sess_t *smf_sess_find_by_paging_n1n2message_location(

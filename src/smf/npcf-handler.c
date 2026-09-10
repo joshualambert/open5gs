@@ -583,15 +583,11 @@ bool smf_npcf_smpolicycontrol_handle_create(
     ogs_assert(up2cp_far);
 
     /* Set UE IP Address to the Default DL PDR */
-    ogs_assert(OGS_OK ==
-        ogs_pfcp_paa_to_ue_ip_addr(&sess->paa,
-            &dl_pdr->ue_ip_addr, &dl_pdr->ue_ip_addr_len));
+    ogs_assert(OGS_OK == smf_sess_pdr_set_ue_ip_addr(sess, dl_pdr));
     dl_pdr->ue_ip_addr.sd = OGS_PFCP_UE_IP_DST;
 
     if (ogs_global_conf()->parameter.use_upg_vpp == true) {
-        ogs_assert(OGS_OK ==
-            ogs_pfcp_paa_to_ue_ip_addr(&sess->paa,
-                &ul_pdr->ue_ip_addr, &ul_pdr->ue_ip_addr_len));
+        ogs_assert(OGS_OK == smf_sess_pdr_set_ue_ip_addr(sess, ul_pdr));
     }
 
     if (sess->session.ipv4_framed_routes &&
@@ -661,10 +657,7 @@ bool smf_npcf_smpolicycontrol_handle_create(
     }
 
     /* Set UE-to-CP Flow-Description and Outer-Header-Creation */
-    up2cp_pdr->flow[up2cp_pdr->num_of_flow].fd = 1;
-    up2cp_pdr->flow[up2cp_pdr->num_of_flow].description =
-        (char *)"permit out 58 from ff02::2/128 to assigned";
-    up2cp_pdr->num_of_flow++;
+    smf_sess_set_up2cp_flow_description(sess);
 
     ogs_assert(OGS_OK ==
         ogs_pfcp_ip_to_outer_header_creation(

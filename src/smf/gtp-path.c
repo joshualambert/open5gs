@@ -37,13 +37,191 @@
 
 #include "event.h"
 #include "gtp-path.h"
+#include "dhcpv6.h"
 #include "local-path.h"
 #include "pfcp-path.h"
 #include "s5c-build.h"
 #include "gn-build.h"
 
 static bool check_if_router_solicit(ogs_pkbuf_t *pkbuf);
-static void send_router_advertisement(smf_sess_t *sess, uint8_t *ip6_dst);
+void smf_gtp_link_local_addr(uint8_t *addr6)
+{
+    ogs_sockaddr_t *link_local = ogs_gtp_self()->link_local_addr;
+
+    ogs_assert(addr6);
+
+    if (link_local && link_local->ogs_sa_family == AF_INET6) {
+        memcpy(addr6, link_local->sin6.sin6_addr.s6_addr, OGS_IPV6_LEN);
+        return;
+    }
+
+    /* For the case of loopback used for GTPU link-local address is not
+     * available, hence set the source IP to fe80::1 */
+    memset(addr6, 0, OGS_IPV6_LEN);
+    addr6[0] = 0xfe;
+    addr6[1] = 0x80;
+    addr6[OGS_IPV6_LEN-1] = 0x01;
+}
+
+int smf_gtp_send_to_ue(smf_sess_t *sess, ogs_pkbuf_t *pkbuf)
+{
+    ogs_pfcp_pdr_t *pdr = NULL;
+
+    ogs_assert(sess);
+    ogs_assert(pkbuf);
+
+    ogs_list_for_each(&sess->pfcp.pdr_list, pdr) {
+        ogs_gtp2_header_desc_t header_desc;
+        ogs_gtp_node_t *gnode = NULL;
+        int rv;
+
+        if (pdr->src_if != OGS_PFCP_INTERFACE_CP_FUNCTION || !pdr->gnode)
+            continue;
+
+        gnode = pdr->gnode;
+        ogs_assert(gnode->sock);
+
+        memset(&header_desc, 0, sizeof(header_desc));
+        header_desc.type = OGS_GTPU_MSGTYPE_GPDU;
+        ogs_gtp2_encapsulate_header(&header_desc, pkbuf);
+
+        rv = ogs_gtp_send_with_teid(
+                gnode->sock, pkbuf, pdr->f_teid.teid, &gnode->addr);
+        ogs_pkbuf_free(pkbuf);
+        if (rv != OGS_OK) {
+            ogs_error("ogs_gtp_send_with_teid() failed");
+            return OGS_ERROR;
+        }
+
+        return OGS_OK;
+    }
+
+    ogs_error("No CP-function PDR with a GTP-U node, packet to UE dropped");
+    ogs_pkbuf_free(pkbuf);
+
+    return OGS_ERROR;
+}
+
+/* RFC 8106 Recursive DNS Server option (fixed part, addresses follow) */
+#ifndef ND_OPT_RDNSS
+#define ND_OPT_RDNSS 25
+#endif
+struct smf_nd_opt_rdnss {
+    uint8_t nd_opt_rdnss_type;
+    uint8_t nd_opt_rdnss_len;
+    uint16_t nd_opt_rdnss_reserved;
+    uint32_t nd_opt_rdnss_lifetime;
+} __attribute__ ((packed));
+
+/*
+ * Router Advertisement per TS 29.061 section 11.2.1.3.2: M=0, O=1 when the
+ * UE can obtain something more with DHCPv6 (delegated prefix or DNS
+ * servers), a single /64 Prefix Information option with A=1 and L=0 and
+ * infinite lifetimes, then MTU and RDNSS. The Prefix Information option
+ * stays first: peers (and tests/common/gtpu.c) read it at a fixed offset.
+ */
+static void send_router_advertisement(smf_sess_t *sess, uint8_t *ip6_dst)
+{
+    ogs_pkbuf_t *pkbuf = NULL;
+
+    ogs_pfcp_ue_ip_t *ue_ip = NULL;
+    uint8_t dns6[MAX_NUM_OF_DNS][OGS_IPV6_LEN];
+    int num_of_dns6 = 0;
+    uint8_t src[OGS_IPV6_LEN];
+
+    size_t size, plen;
+    uint8_t *p = NULL;
+    struct ip6_hdr *ip6_h =  NULL;
+    struct nd_router_advert *advert_h = NULL;
+    struct nd_opt_prefix_info *prefix = NULL;
+
+    ogs_assert(sess);
+    ue_ip = sess->ipv6;
+    ogs_assert(ue_ip);
+    ogs_assert(ue_ip->subnet);
+
+    smf_gtp_link_local_addr(src);
+    num_of_dns6 = smf_dhcpv6_dns_servers(dns6, MAX_NUM_OF_DNS);
+
+    ogs_debug("      Build Router Advertisement");
+
+    plen = sizeof *advert_h + sizeof *prefix;
+    if (smf_self()->mtu)
+        plen += sizeof(struct nd_opt_mtu);
+    if (num_of_dns6)
+        plen += sizeof(struct smf_nd_opt_rdnss) + num_of_dns6 * OGS_IPV6_LEN;
+    size = sizeof *ip6_h + plen;
+
+    pkbuf = ogs_pkbuf_alloc(NULL, OGS_GTPV1U_5GC_HEADER_LEN + size);
+    ogs_assert(pkbuf);
+    ogs_pkbuf_reserve(pkbuf, OGS_GTPV1U_5GC_HEADER_LEN);
+    ogs_pkbuf_put(pkbuf, size);
+    memset(pkbuf->data, 0, pkbuf->len);
+
+    ip6_h = (struct ip6_hdr *)pkbuf->data;
+    advert_h = (struct nd_router_advert *)((uint8_t *)ip6_h + sizeof *ip6_h);
+    prefix = (struct nd_opt_prefix_info *)
+        ((uint8_t*)advert_h + sizeof *advert_h);
+    p = (uint8_t *)prefix + sizeof *prefix;
+
+    advert_h->nd_ra_type = ND_ROUTER_ADVERT;
+    advert_h->nd_ra_code = 0;
+    advert_h->nd_ra_curhoplimit = 64;
+    advert_h->nd_ra_flags_reserved = 0;
+    /* O=1: DHCPv6 has more (delegated prefix and/or DNS), M stays 0 */
+    if (smf_sess_ipv6_prefixlen(sess) < OGS_IPV6_DEFAULT_PREFIX_LEN ||
+        num_of_dns6)
+        advert_h->nd_ra_flags_reserved |= ND_RA_FLAG_OTHER;
+    advert_h->nd_ra_router_lifetime = htobe16(64800);  /* 64800s */
+    advert_h->nd_ra_reachable = 0;
+    advert_h->nd_ra_retransmit = 0;
+
+    prefix->nd_opt_pi_type = ND_OPT_PREFIX_INFORMATION;
+    prefix->nd_opt_pi_len = 4; /* 32bytes */
+    prefix->nd_opt_pi_prefix_len = OGS_IPV6_DEFAULT_PREFIX_LEN;
+    /* TS 29.061 section 11.2.1.3.2: A-flag set, L-flag cleared */
+    prefix->nd_opt_pi_flags_reserved = ND_OPT_PI_FLAG_AUTO;
+    prefix->nd_opt_pi_valid_time = htobe32(0xffffffff); /* Infinite */
+    prefix->nd_opt_pi_preferred_time = htobe32(0xffffffff); /* Infinite */
+    memcpy(prefix->nd_opt_pi_prefix.s6_addr,
+            ue_ip->addr, (OGS_IPV6_DEFAULT_PREFIX_LEN >> 3));
+
+    if (smf_self()->mtu) {
+        struct nd_opt_mtu *mtu = (struct nd_opt_mtu *)p;
+
+        mtu->nd_opt_mtu_type = ND_OPT_MTU;
+        mtu->nd_opt_mtu_len = 1; /* 8bytes */
+        mtu->nd_opt_mtu_mtu = htobe32(smf_self()->mtu);
+
+        p += sizeof *mtu;
+    }
+
+    if (num_of_dns6) {
+        struct smf_nd_opt_rdnss *rdnss = (struct smf_nd_opt_rdnss *)p;
+
+        rdnss->nd_opt_rdnss_type = ND_OPT_RDNSS;
+        rdnss->nd_opt_rdnss_len = 1 + 2 * num_of_dns6; /* 8-octet units */
+        rdnss->nd_opt_rdnss_lifetime = htobe32(0xffffffff); /* Infinite */
+        p += sizeof *rdnss;
+        memcpy(p, dns6, num_of_dns6 * OGS_IPV6_LEN);
+        p += num_of_dns6 * OGS_IPV6_LEN;
+    }
+
+    ogs_assert(p == (uint8_t *)pkbuf->data + size);
+
+    ip6_h->ip6_flow = htobe32(0x60000001);
+    ip6_h->ip6_plen = htobe16(plen);
+    ip6_h->ip6_nxt = IPPROTO_ICMPV6;
+    ip6_h->ip6_hlim = 0xff;
+    memcpy(ip6_h->ip6_src.s6_addr, src, OGS_IPV6_LEN);
+    memcpy(ip6_h->ip6_dst.s6_addr, ip6_dst, OGS_IPV6_LEN);
+
+    advert_h->nd_ra_cksum = ogs_in6_cksum(
+            src, ip6_dst, IPPROTO_ICMPV6, advert_h, plen);
+
+    ogs_debug("      Send Router Advertisement");
+    smf_gtp_send_to_ue(sess, pkbuf);
+}
 
 static void bearer_timeout(ogs_gtp_xact_t *xact, void *data);
 
@@ -219,6 +397,10 @@ static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
             struct ip6_hdr *ip6_h = (struct ip6_hdr *)pkbuf->data;
             ogs_assert(ip6_h);
             send_router_advertisement(sess, ip6_h->ip6_src.s6_addr);
+        } else if (sess->ipv6 && smf_dhcpv6_is_request(pkbuf)) {
+            ogs_pkbuf_t *reply = smf_dhcpv6_handle(sess, pkbuf);
+            if (reply)
+                smf_gtp_send_to_ue(sess, reply);
         }
     } else {
         ogs_error("[DROP] Invalid GTPU Type [%d]", header_desc.type);
@@ -599,136 +781,6 @@ static bool check_if_router_solicit(ogs_pkbuf_t *pkbuf)
     }
 
     return false;
-}
-
-static void send_router_advertisement(smf_sess_t *sess, uint8_t *ip6_dst)
-{
-    int rv;
-
-    ogs_pkbuf_t *pkbuf = NULL;
-
-    ogs_pfcp_pdr_t *pdr = NULL;
-    ogs_pfcp_ue_ip_t *ue_ip = NULL;
-    ogs_pfcp_subnet_t *subnet = NULL;
-    char ipstr[OGS_ADDRSTRLEN];
-
-    ogs_ipsubnet_t src_ipsub;
-    uint16_t plen = 0;
-    uint8_t nxt = 0;
-    uint8_t *p = NULL;
-    struct ip6_hdr *ip6_h =  NULL;
-    struct nd_router_advert *advert_h = NULL;
-    struct nd_opt_prefix_info *prefix = NULL;
-
-    ogs_assert(sess);
-    ue_ip = sess->ipv6;
-    ogs_assert(ue_ip);
-    subnet = ue_ip->subnet;
-    ogs_assert(subnet);
-
-    /* Fetch link-local address for router advertisement */
-    if (ogs_gtp_self()->link_local_addr) {
-        OGS_ADDR(ogs_gtp_self()->link_local_addr, ipstr);
-        rv = ogs_ipsubnet(&src_ipsub, ipstr, NULL);
-        if (rv != OGS_OK) {
-            ogs_error("ogs_ipsubnet() failed");
-            return;
-        }
-    } else {
-        /* For the case of loopback used for GTPU link-local address is not
-         * available, hence set the source IP to fe80::1
-        */
-        memset(src_ipsub.sub, 0, sizeof(src_ipsub.sub));
-        src_ipsub.sub[0] = htobe32(0xfe800000);
-        src_ipsub.sub[3] = htobe32(0x00000001);
-    }
-
-    ogs_debug("      Build Router Advertisement");
-
-    pkbuf = ogs_pkbuf_alloc(NULL, OGS_GTPV1U_5GC_HEADER_LEN+200);
-    ogs_assert(pkbuf);
-    ogs_pkbuf_reserve(pkbuf, OGS_GTPV1U_5GC_HEADER_LEN);
-    ogs_pkbuf_put(pkbuf, 200);
-    memset(pkbuf->data, 0, pkbuf->len);
-
-    p = (uint8_t *)pkbuf->data;
-    ip6_h = (struct ip6_hdr *)p;
-    advert_h = (struct nd_router_advert *)((uint8_t *)ip6_h + sizeof *ip6_h);
-    prefix = (struct nd_opt_prefix_info *)
-        ((uint8_t*)advert_h + sizeof *advert_h);
-
-    advert_h->nd_ra_type = ND_ROUTER_ADVERT;
-    advert_h->nd_ra_code = 0;
-    advert_h->nd_ra_curhoplimit = 64;
-    advert_h->nd_ra_flags_reserved = 0;
-    advert_h->nd_ra_router_lifetime = htobe16(64800);  /* 64800s */
-    advert_h->nd_ra_reachable = 0;
-    advert_h->nd_ra_retransmit = 0;
-
-    prefix->nd_opt_pi_type = ND_OPT_PREFIX_INFORMATION;
-    prefix->nd_opt_pi_len = 4; /* 32bytes */
-    prefix->nd_opt_pi_prefix_len = OGS_IPV6_DEFAULT_PREFIX_LEN;
-    prefix->nd_opt_pi_flags_reserved =
-        ND_OPT_PI_FLAG_ONLINK|ND_OPT_PI_FLAG_AUTO;
-    prefix->nd_opt_pi_valid_time = htobe32(0xffffffff); /* Infinite */
-    prefix->nd_opt_pi_preferred_time = htobe32(0xffffffff); /* Infinite */
-    memcpy(prefix->nd_opt_pi_prefix.s6_addr,
-            ue_ip->addr, (OGS_IPV6_DEFAULT_PREFIX_LEN >> 3));
-
-    /* For IPv6 Pseudo-Header */
-    plen = sizeof *advert_h + sizeof *prefix;
-    nxt = IPPROTO_ICMPV6;
-
-    if (smf_self()->mtu) {
-        struct nd_opt_mtu *mtu =
-            (struct nd_opt_mtu *)((uint8_t*)prefix + sizeof *prefix);
-
-        mtu->nd_opt_mtu_type = ND_OPT_MTU;
-        mtu->nd_opt_mtu_len = 1; /* 8bytes */
-        mtu->nd_opt_mtu_mtu = htobe32(smf_self()->mtu);
-
-        plen += sizeof *mtu;
-    }
-
-    pkbuf->len = sizeof *ip6_h + plen;
-
-    memcpy(p, src_ipsub.sub, sizeof src_ipsub.sub);
-    p += sizeof src_ipsub.sub;
-    memcpy(p, ip6_dst, OGS_IPV6_LEN);
-    p += OGS_IPV6_LEN;
-    p += 2; plen = htobe16(plen); memcpy(p, &plen, 2); p += 2;
-    p += 3; *p = nxt; p += 1;
-
-    advert_h->nd_ra_cksum = ogs_in_cksum((uint16_t *)pkbuf->data, pkbuf->len);
-
-    ip6_h->ip6_flow = htobe32(0x60000001);
-    ip6_h->ip6_plen = plen;
-    ip6_h->ip6_nxt = nxt;  /* ICMPv6 */
-    ip6_h->ip6_hlim = 0xff;
-    memcpy(ip6_h->ip6_src.s6_addr, src_ipsub.sub, sizeof src_ipsub.sub);
-    memcpy(ip6_h->ip6_dst.s6_addr, ip6_dst, OGS_IPV6_LEN);
-
-    ogs_list_for_each(&sess->pfcp.pdr_list, pdr) {
-        if (pdr->src_if == OGS_PFCP_INTERFACE_CP_FUNCTION && pdr->gnode) {
-            ogs_gtp2_header_desc_t header_desc;
-            ogs_gtp_node_t *gnode = pdr->gnode;
-            ogs_assert(gnode);
-            ogs_assert(gnode->sock);
-
-            memset(&header_desc, 0, sizeof(header_desc));
-            header_desc.type = OGS_GTPU_MSGTYPE_GPDU;
-
-            ogs_gtp2_encapsulate_header(&header_desc, pkbuf);
-
-            ogs_gtp_send_with_teid(
-                    gnode->sock, pkbuf, pdr->f_teid.teid, &gnode->addr);
-
-            ogs_debug("      Send Router Advertisement");
-            break;
-        }
-    }
-
-    ogs_pkbuf_free(pkbuf);
 }
 
 static void bearer_timeout(ogs_gtp_xact_t *xact, void *data)

@@ -48,6 +48,16 @@ int smf_gtp2_send_delete_session_response(
 int smf_gtp2_send_delete_bearer_request(
         smf_bearer_t *bearer, uint8_t pti, uint8_t cause_value);
 
+/* Link-local address the SMF uses as source of the packets it sends to the
+ * UE (Router Advertisement, DHCPv6): the one of the GTP-U interface, or
+ * fe80::1 when GTP-U runs on loopback */
+void smf_gtp_link_local_addr(uint8_t *addr6);
+
+/* Send a complete IPv6 packet to the UE through the CP-function PDR of the
+ * session (UPF CP2UP forwarding). `ip6pkt` needs OGS_GTPV1U_5GC_HEADER_LEN
+ * of headroom and is consumed in every case. */
+int smf_gtp_send_to_ue(smf_sess_t *sess, ogs_pkbuf_t *ip6pkt);
+
 #ifdef __cplusplus
 }
 #endif

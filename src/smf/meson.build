@@ -40,6 +40,7 @@ libsmf_sources = files('''
     context.h
     smf-sm.h
     gtp-path.h
+    dhcpv6.h
     gn-build.h
     gn-handler.h
     s5c-build.h
@@ -80,6 +81,7 @@ libsmf_sources = files('''
     gsm-sm.c
     pfcp-sm.c
     gtp-path.c
+    dhcpv6.c
     gn-build.c
     gn-handler.c
     s5c-build.c

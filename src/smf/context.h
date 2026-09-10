@@ -146,7 +146,27 @@ typedef struct smf_context_s {
     ogs_hash_t      *smf_n4_seid_hash; /* hash table (SMF-N4-SEID) */
     ogs_hash_t      *n1n2message_hash; /* hash table (N1N2Message Location) */
 
+    ogs_hash_t      *ipv6_pd_hash;  /* hash table (IPv6 delegated block:
+                                       8 masked octets + 1 length octet) */
+
+#define SMF_DHCPV6_DEFAULT_PREFERRED_LIFETIME   3600
+#define SMF_DHCPV6_DEFAULT_VALID_LIFETIME       7200
+
     uint16_t        mtu;            /* MTU to advertise in PCO */
+
+    /*
+     * DHCPv6 prefix delegation server (smf.dhcpv6 in smf.yaml).
+     * See smf_context_parse_config() for the defaults.
+     */
+    struct {
+        ogs_dhcpv6_duid_t duid;         /* Server DUID */
+        uint32_t preferred_lifetime;    /* seconds */
+        uint32_t valid_lifetime;        /* seconds, >= preferred_lifetime */
+        uint32_t t1;                    /* seconds, 0 = client decides */
+        uint32_t t2;                    /* seconds, 0 = client decides */
+        bool rapid_commit;              /* Solicit + Rapid Commit -> Reply */
+        uint8_t preference;             /* OPTION_PREFERENCE, 0 = omitted */
+    } dhcpv6;
 
     struct  {
         const char *integrity_protection_indication;
@@ -209,6 +229,20 @@ typedef struct smf_ue_s {
 
 typedef struct smf_bearer_s smf_bearer_t;
 typedef struct smf_sess_s smf_sess_t;
+
+/*
+ * DHCPv6 prefix delegation binding (RFC 8415 section 18.3). The delegated
+ * prefix itself is derived from sess->ipv6 and is never stored here; the
+ * binding only remembers which requesting router committed it.
+ */
+typedef struct smf_dhcpv6_binding_s {
+    bool active;                 /* a Request/Rapid-commit committed the
+                                    delegation */
+    ogs_dhcpv6_duid_t client_id; /* DUID of the requesting router */
+    uint32_t iaid;
+    bool pd_exclude;             /* client supports RFC 6603 */
+    ogs_time_t bound_at;         /* last (re)binding time */
+} smf_dhcpv6_binding_t;
 
 typedef struct smf_pf_s {
     ogs_lnode_t     lnode;
@@ -572,6 +606,14 @@ typedef struct smf_sess_s {
     ogs_pfcp_ue_ip_t *ipv4;
     ogs_pfcp_ue_ip_t *ipv6;
 
+    /* Key of this session in smf_self()->ipv6_pd_hash: the network prefix
+     * masked to its length (8 octets) followed by the length (1 octet).
+     * ogs_hash keeps a pointer to the key, hence it lives here. */
+    uint8_t ipv6_pd_key[(OGS_IPV6_DEFAULT_PREFIX_LEN >> 3) + 1];
+
+    /* DHCPv6 prefix delegation state, reset whenever ipv6 changes */
+    smf_dhcpv6_binding_t dhcpv6;
+
     /* AN Type */
     OpenAPI_access_type_e an_type;
 
@@ -760,6 +802,15 @@ smf_sess_t *smf_sess_add_by_psi(smf_ue_t *smf_ue, uint8_t psi);
 
 void smf_sess_select_upf(smf_sess_t *sess);
 uint8_t smf_sess_set_ue_ip(smf_sess_t *sess);
+/* Effective length of the session's IPv6 network prefix ("block"):
+ * 64 without prefix delegation, else 1..63. 0 when there is no IPv6. */
+uint8_t smf_sess_ipv6_prefixlen(smf_sess_t *sess);
+/* Fill pdr->ue_ip_addr from sess->paa, including the IPv6 prefix
+ * delegation bits when the session owns a block shorter than /64 */
+int smf_sess_pdr_set_ue_ip_addr(smf_sess_t *sess, ogs_pfcp_pdr_t *pdr);
+/* Add the SDF filters that steer Router Solicitations and DHCPv6 requests
+ * from the UE to the SMF (UP2CP PDR) */
+void smf_sess_set_up2cp_flow_description(smf_sess_t *sess);
 void smf_sess_set_paging_n1n2message_location(
         smf_sess_t *sess, char *n1n2message_location);
 
