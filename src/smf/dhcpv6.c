@@ -442,11 +442,13 @@ static void binding_release(smf_sess_t *sess)
  */
 
 /* RFC 8415 section 18.4: a unicast message is answered with UseMulticast,
- * Server-ID, Client-ID and nothing else */
+ * Server-ID, Client-ID and nothing else - in an Advertise when the
+ * message was a Solicit, in a Reply for any other message type */
 static bool handle_unicast(
         ogs_dhcpv6_message_t *rsp, const ogs_dhcpv6_message_t *req)
 {
-    reply_init(rsp, req, OGS_DHCPV6_REPLY);
+    reply_init(rsp, req, req->msg_type == OGS_DHCPV6_SOLICIT ?
+            OGS_DHCPV6_ADVERTISE : OGS_DHCPV6_REPLY);
     status_set(&rsp->status, OGS_DHCPV6_STATUS_USE_MULTICAST, NULL);
 
     return true;
