@@ -1,0 +1,77 @@
+# Development / test loop for Open5GS that keeps the host clean.
+#
+#   The source tree is bind-mounted into the container, the meson build
+#   directory lives on a named volume, and MongoDB runs as a sidecar.
+#   Nothing is installed on the host.
+#
+#   Build once (or after every change):
+#       docker compose -f docker/devtest/docker-compose.yml run --rm build
+#   Run the whole test-suite:
+#       docker compose -f docker/devtest/docker-compose.yml run --rm test
+#   Run a subset (any `meson test` arguments):
+#       docker compose -f docker/devtest/docker-compose.yml run --rm test ipv6-pd
+#   Interactive shell with the network set-up already done:
+#       docker compose -f docker/devtest/docker-compose.yml run --rm shell
+#
+#   Environment knobs:
+#       HOST_UID / HOST_GID     owner of the files written to the source tree
+#       OPEN5GS_BUILD_VOLUME    name of the build volume (default open5gs-build)
+#       NINJA_JOBS              parallelism for ninja (default: all cores)
+#       MESON_SETUP_ARGS        extra `meson setup` arguments, e.g. -Db_sanitize=address
+#       DIST / TAG              base image (default ubuntu / noble)
+#
+#   Several independent checkouts can share the host by using a different
+#   compose project name (`docker compose -p <name> ...`) and build volume.
+#
+#   The base image comes from ../<dist>/<tag>/base (build it first with
+#   `DIST=ubuntu TAG=noble docker compose -f docker/docker-compose.yml build base`).
+
+x-open5gs: &open5gs
+  image: ${USER}/${DIST-ubuntu}-${TAG-noble}-open5gs-base
+  working_dir: /open5gs
+  volumes:
+    - ../..:/open5gs
+    - open5gs-build:/open5gs/build
+  environment:
+    - HOME=/tmp
+    - HOST_UID=${HOST_UID-1000}
+    - HOST_GID=${HOST_GID-1000}
+    - NINJA_JOBS=${NINJA_JOBS-0}
+    - MESON_SETUP_ARGS=${MESON_SETUP_ARGS-}
+    - DB_URI=mongodb://mongodb/open5gs
+
+x-netcaps: &netcaps
+  cap_add:
+    - NET_ADMIN
+  devices:
+    - "/dev/net/tun:/dev/net/tun"
+  sysctls:
+    - net.ipv6.conf.all.disable_ipv6=0
+    - net.ipv6.conf.default.disable_ipv6=0
+    - net.ipv6.conf.all.forwarding=1
+  hostname: open5gs-test
+
+services:
+  mongodb:
+    image: mongo:7
+    command: mongod --quiet --logpath /dev/null
+
+  build:
+    <<: *open5gs
+    entrypoint: ["/open5gs/docker/devtest/build.sh"]
+
+  test:
+    <<: [*open5gs, *netcaps]
+    depends_on:
+      - mongodb
+    entrypoint: ["/open5gs/docker/devtest/test.sh"]
+
+  shell:
+    <<: [*open5gs, *netcaps]
+    depends_on:
+      - mongodb
+    entrypoint: ["/bin/bash", "-c", "/open5gs/docker/devtest/setup-net.sh && exec /bin/bash"]
+
+volumes:
+  open5gs-build:
+    name: ${OPEN5GS_BUILD_VOLUME-open5gs-build}
