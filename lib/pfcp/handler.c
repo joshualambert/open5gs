@@ -771,6 +771,38 @@ ogs_pfcp_pdr_t *ogs_pfcp_handle_create_pdr(ogs_pfcp_sess_t *sess,
     pdr->ue_ip_addr_len = 0;
 
     if (message->pdi.ue_ip_address.presence) {
+        const ogs_pfcp_ue_ip_addr_t *ue_ip_addr =
+            message->pdi.ue_ip_address.data;
+        int min_len = 1; /* flags */
+
+        if (!message->pdi.ue_ip_address.len || !ue_ip_addr) {
+            ogs_error("No UE IP Address LEN");
+            *cause_value = OGS_PFCP_CAUSE_INVALID_LENGTH;
+            *offending_ie_value = OGS_PFCP_UE_IP_ADDRESS_TYPE;
+            return NULL;
+        }
+
+        /*
+         * TS 29.244 8.2.62:
+         * flags(1) [IPv4(4)] [IPv6(16)] [IPv6 Prefix Delegation Bits(1)]
+         */
+        if (ue_ip_addr->ipv4)
+            min_len += OGS_IPV4_LEN;
+        if (ue_ip_addr->ipv6)
+            min_len += OGS_IPV6_LEN;
+        if (ue_ip_addr->ipv6d)
+            min_len += 1;
+
+        if (message->pdi.ue_ip_address.len < min_len) {
+            ogs_error("Invalid UE IP Address LEN[%d] < [%d] "
+                    "(V4:%d V6:%d IPv6D:%d)",
+                    message->pdi.ue_ip_address.len, min_len,
+                    ue_ip_addr->ipv4, ue_ip_addr->ipv6, ue_ip_addr->ipv6d);
+            *cause_value = OGS_PFCP_CAUSE_INVALID_LENGTH;
+            *offending_ie_value = OGS_PFCP_UE_IP_ADDRESS_TYPE;
+            return NULL;
+        }
+
         pdr->ue_ip_addr_len =
             ogs_min(message->pdi.ue_ip_address.len, sizeof(pdr->ue_ip_addr));
         memcpy(&pdr->ue_ip_addr, message->pdi.ue_ip_address.data,

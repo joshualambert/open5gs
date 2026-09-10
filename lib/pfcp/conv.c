@@ -410,6 +410,107 @@ int ogs_pfcp_paa_to_ue_ip_addr(
     return OGS_OK;
 }
 
+/*
+ * Length of the UE IP Address IE up to and including the IPv6 address,
+ * i.e. without the optional IPv6 Prefix Delegation Bits octet:
+ * flags(1) [IPv4(4)] [IPv6(16)]
+ */
+static int ue_ip_addr_base_len(const ogs_pfcp_ue_ip_addr_t *addr)
+{
+    int len = 1;
+
+    ogs_assert(addr);
+
+    if (addr->ipv4)
+        len += OGS_IPV4_LEN;
+    if (addr->ipv6)
+        len += OGS_IPV6_LEN;
+
+    return len;
+}
+
+int ogs_pfcp_ue_ip_addr_set_ipv6_prefixlen(
+        ogs_pfcp_ue_ip_addr_t *addr, int *len, uint8_t prefixlen)
+{
+    uint8_t *pd_bits = NULL;
+    int base_len;
+
+    ogs_assert(addr);
+    ogs_assert(len);
+
+    if (!addr->ipv6) {
+        ogs_error("No IPv6 in UE IP Address");
+        return OGS_ERROR;
+    }
+
+    if (addr->ip6pl) {
+        ogs_error("IP6PL is not supported in UE IP Address");
+        return OGS_ERROR;
+    }
+
+    if (prefixlen < 1 || prefixlen > OGS_IPV6_DEFAULT_PREFIX_LEN) {
+        ogs_error("Invalid IPv6 prefixlen [%d]", prefixlen);
+        return OGS_ERROR;
+    }
+
+    base_len = ue_ip_addr_base_len(addr);
+
+    /* The trailing octet follows the IPv6 address, whose position
+     * depends on whether an IPv4 address is present */
+    if (addr->ipv4)
+        pd_bits = &addr->both.ipv6_prefix_delegation_bits;
+    else
+        pd_bits = &addr->ipv6_prefix_delegation_bits;
+
+    if (prefixlen == OGS_IPV6_DEFAULT_PREFIX_LEN) {
+        addr->ipv6d = 0;
+        *pd_bits = 0;
+        *len = base_len;
+    } else {
+        addr->ipv6d = 1;
+        *pd_bits = OGS_IPV6_DEFAULT_PREFIX_LEN - prefixlen;
+        *len = base_len + 1;
+    }
+
+    return OGS_OK;
+}
+
+uint8_t ogs_pfcp_ue_ip_addr_ipv6_prefixlen(
+        const ogs_pfcp_ue_ip_addr_t *addr, int len)
+{
+    uint8_t pd_bits;
+    int base_len;
+
+    ogs_assert(addr);
+
+    if (!addr->ipv6d)
+        return OGS_IPV6_DEFAULT_PREFIX_LEN;
+
+    if (!addr->ipv6) {
+        ogs_error("IPv6D is set without IPv6 in UE IP Address");
+        return 0;
+    }
+
+    base_len = ue_ip_addr_base_len(addr);
+    if (len < base_len + 1) {
+        ogs_error("UE IP Address too short for IPv6D [len:%d < %d]",
+                len, base_len + 1);
+        return 0;
+    }
+
+    if (addr->ipv4)
+        pd_bits = addr->both.ipv6_prefix_delegation_bits;
+    else
+        pd_bits = addr->ipv6_prefix_delegation_bits;
+
+    if (pd_bits < 1 || pd_bits >= OGS_IPV6_DEFAULT_PREFIX_LEN) {
+        ogs_error("Invalid IPv6 Prefix Delegation Bits [%d]", pd_bits);
+        return 0;
+    }
+
+    return OGS_IPV6_DEFAULT_PREFIX_LEN - pd_bits;
+}
+
 int ogs_pfcp_ip_to_outer_header_creation(ogs_ip_t *ip,
         ogs_pfcp_outer_header_creation_t *outer_header_creation, int *len)
 {

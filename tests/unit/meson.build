@@ -29,6 +29,7 @@ testunit_unit_sources = files('''
     mme-dns-select-test.c
     ipfw-test.c
     pfcp-rule-test.c
+    pfcp-ue-ip-test.c
 '''.split())
 
 testunit_unit_exe = executable('unit',

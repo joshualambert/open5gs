@@ -50,6 +50,24 @@ int ogs_pfcp_user_plane_ip_resource_info_to_f_teid(
 int ogs_pfcp_paa_to_ue_ip_addr(
     ogs_paa_t *paa, ogs_pfcp_ue_ip_addr_t *addr, int *len);
 
+/*
+ * IPv6 prefix delegation (TS 29.244 8.2.62, IPv6D flag)
+ *
+ * ogs_pfcp_ue_ip_addr_set_ipv6_prefixlen() sets IPv6D and the "IPv6 Prefix
+ * Delegation Bits" octet (64 - prefixlen) when prefixlen is 1..63, or clears
+ * them when prefixlen is 64. *len is recomputed from the flags, so the call
+ * is idempotent. Requires addr->ipv6 == 1; returns OGS_ERROR otherwise or
+ * for an out-of-range prefixlen.
+ *
+ * ogs_pfcp_ue_ip_addr_ipv6_prefixlen() returns 64 when IPv6D is not set,
+ * the network prefix length (1..63) when it is, or 0 when the IE is
+ * malformed (len too short for the trailing octet, bits outside 1..63).
+ */
+int ogs_pfcp_ue_ip_addr_set_ipv6_prefixlen(
+        ogs_pfcp_ue_ip_addr_t *addr, int *len, uint8_t prefixlen);
+uint8_t ogs_pfcp_ue_ip_addr_ipv6_prefixlen(
+        const ogs_pfcp_ue_ip_addr_t *addr, int len);
+
 int ogs_pfcp_ip_to_outer_header_creation(ogs_ip_t *ip,
     ogs_pfcp_outer_header_creation_t *outer_header_creation, int *len);
 void ogs_pfcp_outer_header_creation_to_ip(

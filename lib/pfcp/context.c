@@ -763,6 +763,7 @@ int ogs_pfcp_context_parse_config(const char *local, const char *remote)
                         const char *dev = self.tun_ifname;
                         const char *low[OGS_MAX_NUM_OF_SUBNET_RANGE];
                         const char *high[OGS_MAX_NUM_OF_SUBNET_RANGE];
+                        const char *prefix_delegation = NULL;
                         int i, num = 0;
 
                         memset(low, 0, sizeof(low));
@@ -803,6 +804,10 @@ int ogs_pfcp_context_parse_config(const char *local, const char *remote)
                                 dnn = ogs_yaml_iter_value(&subnet_iter);
                             } else if (!strcmp(subnet_key, "dev")) {
                                 dev = ogs_yaml_iter_value(&subnet_iter);
+                            } else if (!strcmp(subnet_key,
+                                        "prefix_delegation")) {
+                                prefix_delegation =
+                                    ogs_yaml_iter_value(&subnet_iter);
                             } else if (!strcmp(subnet_key, "range")) {
                                 ogs_yaml_iter_t range_iter;
                                 ogs_yaml_iter_recurse(
@@ -849,6 +854,18 @@ int ogs_pfcp_context_parse_config(const char *local, const char *remote)
                         for (i = 0; i < subnet->num_of_range; i++) {
                             subnet->range[i].low = low[i];
                             subnet->range[i].high = high[i];
+                        }
+
+                        if (prefix_delegation) {
+                            rv = ogs_pfcp_subnet_set_prefix_delegation(
+                                    subnet, prefix_delegation);
+                            if (rv != OGS_OK) {
+                                ogs_error("Invalid %s.session.prefix_"
+                                        "delegation: '%s' in '%s'",
+                                        local, prefix_delegation,
+                                        ogs_app()->file);
+                                return rv;
+                            }
                         }
 
                     } while (ogs_yaml_iter_type(&subnet_array) ==
@@ -2512,6 +2529,154 @@ void ogs_pfcp_rule_remove_all(ogs_pfcp_pdr_t *pdr)
         ogs_pfcp_rule_remove(rule);
 }
 
+/*
+ * IPv6 pool generation
+ *
+ * The pool is generated in units of one network prefix ("block") of length
+ * L = subnet->pd_prefixlen (or 64 when prefix delegation is disabled) per
+ * session. The first 64 bits of the address are handled as one unsigned
+ * integer (the two big-endian words addr[0] and addr[1]); entry i covers
+ * the block base + (i << (64 - L)) and its addr[0..1] is the lowest /64
+ * of that block, addr[3] a unique interface identifier.
+ *
+ * With L = 64 this yields exactly the historic per-/64 pool.
+ */
+static uint64_t ipv6_prefix_to_u64(const uint32_t *addr)
+{
+    ogs_assert(addr);
+    return ((uint64_t)be32toh(addr[0]) << 32) | (uint64_t)be32toh(addr[1]);
+}
+
+static void u64_to_ipv6_prefix(uint64_t prefix, uint32_t *addr)
+{
+    ogs_assert(addr);
+    addr[0] = htobe32((uint32_t)(prefix >> 32));
+    addr[1] = htobe32((uint32_t)(prefix & 0xffffffffULL));
+}
+
+static int ue_pool_generate_ipv6(ogs_pfcp_subnet_t *subnet)
+{
+    int rv;
+    uint8_t prefixlen;
+    uint64_t blocksize, blockmask;
+    uint64_t network, broadcast, gateway, last_block;
+    int rangeindex, num_of_range;
+    int poolindex;
+
+    ogs_assert(subnet);
+    ogs_assert(subnet->family == AF_INET6);
+
+    prefixlen = subnet->pd_prefixlen;
+    if (!prefixlen)
+        prefixlen = OGS_IPV6_DEFAULT_PREFIX_LEN;
+    ogs_assert(prefixlen >= 1 && prefixlen <= OGS_IPV6_DEFAULT_PREFIX_LEN);
+
+    blocksize = (uint64_t)1 << (OGS_IPV6_DEFAULT_PREFIX_LEN - prefixlen);
+    blockmask = ~(blocksize - 1);
+
+    network = ipv6_prefix_to_u64(subnet->sub.sub);
+    broadcast = network | ~ipv6_prefix_to_u64(subnet->sub.mask);
+    gateway = ipv6_prefix_to_u64(subnet->gw.sub);
+
+    /*
+     * The block holding the last address of the subnet is never used,
+     * exactly like the last /64 was never used before. A subnet that is
+     * not larger than one block therefore yields no entry at all.
+     */
+    if ((broadcast & blockmask) < blocksize ||
+        (broadcast & blockmask) - blocksize < network) {
+        subnet->pool.size = subnet->pool.avail = 0;
+        return OGS_OK;
+    }
+    last_block = (broadcast & blockmask) - blocksize;
+
+    num_of_range = subnet->num_of_range;
+    if (!num_of_range) num_of_range = 1;
+
+    poolindex = 0;
+    for (rangeindex = 0; rangeindex < num_of_range; rangeindex++) {
+        uint64_t start, end, block;
+        int inc;
+
+        if (subnet->num_of_range &&
+            subnet->range[rangeindex].low) {
+            ogs_ipsubnet_t low;
+            rv = ogs_ipsubnet(&low, subnet->range[rangeindex].low, NULL);
+            ogs_assert(rv == OGS_OK);
+            start = ipv6_prefix_to_u64(low.sub);
+
+            /* Align low up to a block boundary */
+            if (start & ~blockmask) {
+                start &= blockmask;
+                if (start > last_block)
+                    continue; /* Range is above the subnet */
+                start += blocksize;
+            }
+        } else {
+            start = network;
+        }
+
+        if (start < network)
+            start = network;
+
+        if (subnet->num_of_range &&
+            subnet->range[rangeindex].high) {
+            ogs_ipsubnet_t high;
+            rv = ogs_ipsubnet(&high, subnet->range[rangeindex].high, NULL);
+            ogs_assert(rv == OGS_OK);
+
+            /* Align high down to a block boundary (inclusive) */
+            end = ipv6_prefix_to_u64(high.sub) & blockmask;
+            if (end > last_block)
+                end = last_block;
+        } else {
+            end = last_block;
+        }
+
+        inc = 0;
+        for (block = start; block <= end; block += blocksize) {
+            ogs_pfcp_ue_ip_t *ue_ip = NULL;
+
+            if (poolindex >= ogs_app()->pool.sess)
+                break;
+
+            inc++;
+
+            /* Exclude the block containing the Network Address */
+            if ((network & blockmask) == block)
+                continue;
+
+            /* Exclude the block containing the TUN IP Address */
+            if ((gateway & blockmask) == block)
+                continue;
+
+            ue_ip = &subnet->pool.array[poolindex];
+            ogs_assert(ue_ip);
+            memset(ue_ip, 0, sizeof *ue_ip);
+            ue_ip->subnet = subnet;
+
+            u64_to_ipv6_prefix(block, ue_ip->addr);
+
+            /* Allocate Full IPv6 Address */
+            ue_ip->addr[3] += htobe32(inc);
+
+            ogs_trace("[%d] - %x:%x:%x:%x/%d",
+                    poolindex,
+                    ue_ip->addr[0], ue_ip->addr[1],
+                    ue_ip->addr[2], ue_ip->addr[3], prefixlen);
+
+            poolindex++;
+
+            /* Do not wrap around at the end of the address space */
+            if (block > UINT64_MAX - blocksize)
+                break;
+        }
+    }
+    subnet->pool.size = subnet->pool.avail = poolindex;
+
+    return OGS_OK;
+}
+
 int ogs_pfcp_ue_pool_generate(void)
 {
     int i, rv;
@@ -2529,8 +2694,9 @@ int ogs_pfcp_ue_pool_generate(void)
             maxbytes = 4;
             lastindex = 0;
         } else if (subnet->family == AF_INET6) {
-            maxbytes = 8; /* Default Prefixlen 64bits */
-            lastindex = 1;
+            rv = ue_pool_generate_ipv6(subnet);
+            ogs_assert(rv == OGS_OK);
+            continue;
         } else {
             /* subnet->family might be AF_UNSPEC. So, skip it */
             continue;
@@ -2680,6 +2846,16 @@ void ogs_pfcp_ue_ip_free(ogs_pfcp_ue_ip_t *ue_ip)
     }
 }
 
+uint8_t ogs_pfcp_ue_ip_prefixlen(const ogs_pfcp_ue_ip_t *ue_ip)
+{
+    ogs_assert(ue_ip);
+
+    if (!ue_ip->subnet || !ue_ip->subnet->pd_prefixlen)
+        return OGS_IPV6_DEFAULT_PREFIX_LEN;
+
+    return ue_ip->subnet->pd_prefixlen;
+}
+
 ogs_pfcp_dev_t *ogs_pfcp_dev_add(const char *ifname)
 {
     ogs_pfcp_dev_t *dev = NULL;
@@ -2803,6 +2979,50 @@ ogs_pfcp_subnet_t *ogs_pfcp_subnet_add(
     ogs_list_add(&self.subnet_list, subnet);
 
     return subnet;
+}
+
+int ogs_pfcp_subnet_set_prefix_delegation(
+        ogs_pfcp_subnet_t *subnet, const char *value)
+{
+    char *end = NULL;
+    long prefixlen;
+
+    ogs_assert(subnet);
+    ogs_assert(value);
+
+    prefixlen = strtol(value, &end, 10);
+    if (end == value || !end || *end != '\0' || prefixlen < 0) {
+        ogs_error("prefix_delegation: '%s' is not a number", value);
+        return OGS_ERROR;
+    }
+
+    if (prefixlen == 0) {
+        /* Explicitly disabled */
+        subnet->pd_prefixlen = 0;
+        return OGS_OK;
+    }
+
+    if (subnet->family != AF_INET6) {
+        ogs_error("prefix_delegation: only supported for IPv6 subnets");
+        return OGS_ERROR;
+    }
+
+    if (prefixlen >= OGS_IPV6_DEFAULT_PREFIX_LEN) {
+        ogs_error("prefix_delegation: %ld is out of range [1..%d]",
+                prefixlen, OGS_IPV6_DEFAULT_PREFIX_LEN - 1);
+        return OGS_ERROR;
+    }
+
+    if (prefixlen < subnet->prefixlen) {
+        ogs_error("prefix_delegation: %ld is shorter than "
+                "the subnet prefix length %d",
+                prefixlen, subnet->prefixlen);
+        return OGS_ERROR;
+    }
+
+    subnet->pd_prefixlen = (uint8_t)prefixlen;
+
+    return OGS_OK;
 }
 
 void ogs_pfcp_subnet_remove(ogs_pfcp_subnet_t *subnet)

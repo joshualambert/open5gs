@@ -359,6 +359,20 @@ typedef struct ogs_pfcp_sess_mark_s {
 
 typedef struct ogs_pfcp_subnet_s ogs_pfcp_subnet_t;
 typedef struct ogs_pfcp_ue_ip_s {
+    /*
+     * IPv4: addr[0] holds the UE address.
+     *
+     * IPv6: addr[0..1] hold the /64 link prefix and addr[2..3] the
+     * interface identifier given to the UE.
+     *
+     * When the IPv6 subnet has prefix delegation enabled
+     * (ogs_pfcp_subnet_t.pd_prefixlen != 0) the entry represents the whole
+     * network prefix ("block") of that length: addr[0..1] is the lowest /64
+     * of the block (used as the link prefix in the PAA / RA), and the rest
+     * of the block belongs to the same session and is available for
+     * DHCPv6 prefix delegation. ogs_pfcp_ue_ip_prefixlen() returns the
+     * block length (64 when prefix delegation is disabled).
+     */
     uint32_t        addr[4];
     bool            static_ip;
 
@@ -393,6 +407,10 @@ typedef struct ogs_pfcp_subnet_s {
 
     int             family;         /* AF_INET or AF_INET6 */
     uint8_t         prefixlen;      /* prefixlen */
+    uint8_t         pd_prefixlen;   /* IPv6 prefix delegation:
+                                       0 = disabled, else 1..63 = length of
+                                       the network prefix ("block") given to
+                                       each session (IPv6 subnets only) */
     OGS_POOL(pool, ogs_pfcp_ue_ip_t);
 
     ogs_pfcp_dev_t  *dev;           /* Related Context */
@@ -517,6 +535,9 @@ void ogs_pfcp_rule_remove(ogs_pfcp_rule_t *rule);
 void ogs_pfcp_rule_remove_all(ogs_pfcp_pdr_t *pdr);
 
 int ogs_pfcp_ue_pool_generate(void);
+/* Effective prefix length of an IPv6 pool entry:
+ * subnet->pd_prefixlen, or 64 when there is no subnet or PD is disabled */
+uint8_t ogs_pfcp_ue_ip_prefixlen(const ogs_pfcp_ue_ip_t *ue_ip);
 ogs_pfcp_ue_ip_t *ogs_pfcp_ue_ip_alloc(
         uint8_t *cause_value, int family, const char *dnn, uint8_t *addr);
 void ogs_pfcp_ue_ip_free(ogs_pfcp_ue_ip_t *ip);
@@ -530,6 +551,10 @@ ogs_pfcp_subnet_t *ogs_pfcp_subnet_add(
         const char *ipstr, const char *mask_or_numbits,
         const char *gateway, const char *dnn, const char *ifname);
 ogs_pfcp_subnet_t *ogs_pfcp_subnet_next(ogs_pfcp_subnet_t *subnet);
+/* Parse/validate `prefix_delegation: <value>` for a subnet
+ * (0 = disabled, 1..63 and >= subnet prefixlen for IPv6 subnets) */
+int ogs_pfcp_subnet_set_prefix_delegation(
+        ogs_pfcp_subnet_t *subnet, const char *value);
 void ogs_pfcp_subnet_remove(ogs_pfcp_subnet_t *subnet);
 void ogs_pfcp_subnet_remove_all(void);
 ogs_pfcp_subnet_t *ogs_pfcp_find_subnet(int family);
