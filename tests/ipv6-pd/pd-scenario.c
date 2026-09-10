@@ -607,15 +607,16 @@ void pd_scenario_negative(pd_ctx_t *ctx)
     uint8_t src6[OGS_IPV6_LEN];
     int len, i;
 
-    /* Solicit sent unicast to the router -> Reply with UseMulticast */
+    /* Solicit sent unicast to the router -> Advertise with UseMulticast
+     * (RFC 8415 section 18.4: Advertise for a Solicit, Reply otherwise) */
     msg_init(ctx, &msg, TEST_DHCPV6_SOLICIT, false);
     msg_add_oro(&msg, true);
     msg_add_ia_pd_hint(&msg);
     if (!pd_send(ctx, &msg, ctx->ra.src))
         return;
-    if (!pd_recv(ctx, &reply, "Reply (UseMulticast)"))
+    if (!pd_recv(ctx, &reply, "Advertise (UseMulticast)"))
         return;
-    ABTS_INT_EQUAL(tc, TEST_DHCPV6_REPLY, reply.msg_type);
+    ABTS_INT_EQUAL(tc, TEST_DHCPV6_ADVERTISE, reply.msg_type);
     ABTS_INT_EQUAL(tc, ctx->xid, reply.transaction_id);
     ABTS_TRUE(tc, reply.server_id.len > 0);
     ABTS_TRUE(tc, test_dhcpv6_duid_equal(&ctx->client_id, &reply.client_id));
