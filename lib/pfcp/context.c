@@ -150,6 +150,15 @@ static int ogs_pfcp_check_subnet_overlapping(void)
     ogs_list_for_each(&self.subnet_list, subnet){
         for (next_subnet = ogs_list_next(subnet); (next_subnet);
                 next_subnet = ogs_list_next(next_subnet)) {
+            /*
+             * A `static: true` subnet has no pool and is chosen by
+             * containment before any dynamic subnet (DESIGN.md 5.3, 5.5),
+             * so it may be nested inside a dynamic subnet of the same DNN:
+             * only two dynamic pools must not overlap.
+             */
+            if (subnet->static_only || next_subnet->static_only)
+                continue;
+
             if ((strlen(subnet->dnn) == 0 ||
                  strlen(next_subnet->dnn) == 0 ||
                 (strcmp(subnet->dnn, next_subnet->dnn)) == 0) &&
@@ -2814,19 +2823,26 @@ ogs_pfcp_ue_ip_t *ogs_pfcp_ue_ip_alloc(
         return NULL;
     }
 
-    if (dnn)
-        subnet = ogs_pfcp_find_subnet_by_dnn(family, dnn);
-    else
-        subnet = ogs_pfcp_find_subnet(family);
-
-    if (subnet == NULL) {
-        ogs_error("All IP addresses in all subnets are occupied");
-        *cause_value = OGS_PFCP_CAUSE_NO_RESOURCES_AVAILABLE;
-        return NULL;
-    }
-
     /* if assigning a static IP, do so. If not, assign dynamically! */
     if (memcmp(addr, zero, maxbytes) != 0) {
+        char buf[OGS_ADDRSTRLEN];
+
+        /*
+         * A static address is attached to the subnet that contains it
+         * (DESIGN.md 5.3), never to "the first pool of the DNN": the
+         * subnet decides the tun device, the delegated prefix length and
+         * the per-session route. There is no fallback to another subnet.
+         */
+        subnet = ogs_pfcp_find_subnet_by_addr(family, dnn, addr);
+        if (subnet == NULL) {
+            ogs_error("Static UE IP %s is not inside any subnet of DNN[%s]",
+                    family == AF_INET ?
+                        OGS_INET_NTOP(addr, buf) : OGS_INET6_NTOP(addr, buf),
+                    dnn ? dnn : "");
+            *cause_value = OGS_PFCP_CAUSE_NO_RESOURCES_AVAILABLE;
+            return NULL;
+        }
+
         ue_ip = ogs_calloc(1, sizeof(ogs_pfcp_ue_ip_t));
         if (!ue_ip) {
             ogs_error("All dynamic addresses are occupied");
@@ -2838,6 +2854,24 @@ ogs_pfcp_ue_ip_t *ogs_pfcp_ue_ip_alloc(
         ue_ip->static_ip = true;
         memcpy(ue_ip->addr, addr, maxbytes);
     } else {
+        /*
+         * Dynamic: the first subnet of the DNN (exact DNN match first,
+         * then DNN-less subnets, each in configuration order) that still
+         * has a free entry. static_only subnets have no pool and are
+         * never chosen here (DESIGN.md 5.4, 5.5).
+         */
+        if (dnn)
+            subnet = ogs_pfcp_find_subnet_by_dnn(family, dnn);
+        else
+            subnet = ogs_pfcp_find_subnet(family);
+
+        if (subnet == NULL) {
+            ogs_error("All IP addresses in all subnets are occupied "
+                    "[family:%d DNN:%s]", family, dnn ? dnn : "");
+            *cause_value = OGS_PFCP_CAUSE_NO_RESOURCES_AVAILABLE;
+            return NULL;
+        }
+
         ogs_pool_alloc(&subnet->pool, &ue_ip);
         if (!ue_ip) {
             ogs_error("No resources available");
@@ -3063,38 +3097,113 @@ void ogs_pfcp_subnet_remove_all(void)
         ogs_pfcp_subnet_remove(subnet);
 }
 
-ogs_pfcp_subnet_t *ogs_pfcp_find_subnet(int family)
+/*
+ * Subnet selection (DESIGN.md 5.3 - 5.5)
+ *
+ * The subnets of a DNN are visited in two passes, each in configuration
+ * order: first the subnets whose `dnn:` equals the requested DNN
+ * (case-insensitive), then the DNN-less subnets, which serve any DNN.
+ *
+ *  - dynamic (addr == NULL): the first subnet that is not `static: true`
+ *    and still has a free pool entry. A DNN may therefore span several
+ *    non-contiguous pools; they are drained in configuration order.
+ *  - static (addr != NULL): the first subnet whose network contains the
+ *    address, with `static: true` subnets taking precedence over dynamic
+ *    ones so that a static-only subnet nested inside a dynamic pool wins
+ *    for the addresses it contains, while statics kept inside a dynamic
+ *    subnet (outside its `range:`) keep working. Exhausted pools are
+ *    eligible. Precedence:
+ *      1. `static: true`, exact DNN      3. dynamic, exact DNN
+ *      2. `static: true`, DNN-less       4. dynamic, DNN-less
+ */
+static bool subnet_contains(const ogs_pfcp_subnet_t *subnet,
+        int family, const uint8_t *addr)
+{
+    uint32_t a[4];
+    int i, words;
+
+    ogs_assert(subnet);
+    ogs_assert(addr);
+
+    words = (family == AF_INET) ? 1 : 4;
+    memcpy(a, addr, words * sizeof(uint32_t));
+
+    for (i = 0; i < words; i++) {
+        if ((a[i] & subnet->sub.mask[i]) != subnet->sub.sub[i])
+            return false;
+    }
+
+    return true;
+}
+
+static ogs_pfcp_subnet_t *find_subnet(
+        int family, const char *dnn, const uint8_t *addr)
 {
     ogs_pfcp_subnet_t *subnet = NULL;
+    int pass;
 
     ogs_assert(family == AF_INET || family == AF_INET6);
 
-    ogs_list_for_each(&self.subnet_list, subnet) {
-        if ((subnet->family == AF_UNSPEC || subnet->family == family) &&
-            (strlen(subnet->dnn) == 0) &&
-            subnet->pool.avail)
-            break;
+    /*
+     * pass 0/1: `static: true` subnets, exact DNN / DNN-less
+     *           (static addresses only; dynamic never uses them)
+     * pass 2/3: dynamic subnets, exact DNN / DNN-less
+     * The exact-DNN passes are skipped without a DNN.
+     */
+    for (pass = addr ? 0 : 2; pass < 4; pass++) {
+        bool want_static = (pass < 2);
+        bool want_exact = (pass % 2 == 0);
+
+        if (want_exact && !dnn)
+            continue;
+
+        ogs_list_for_each(&self.subnet_list, subnet) {
+            if (subnet->family != family)
+                continue;
+
+            if (subnet->static_only != want_static)
+                continue;
+
+            if (want_exact) {
+                if (strlen(subnet->dnn) == 0 ||
+                    ogs_strcasecmp(subnet->dnn, dnn) != 0)
+                    continue;
+            } else {
+                if (strlen(subnet->dnn))
+                    continue;
+            }
+
+            if (addr) {
+                if (subnet_contains(subnet, family, addr))
+                    return subnet;
+            } else {
+                if (subnet->pool.avail)
+                    return subnet;
+            }
+        }
     }
 
-    return subnet;
+    return NULL;
+}
+
+ogs_pfcp_subnet_t *ogs_pfcp_find_subnet(int family)
+{
+    return find_subnet(family, NULL, NULL);
 }
 
 ogs_pfcp_subnet_t *ogs_pfcp_find_subnet_by_dnn(int family, const char *dnn)
 {
-    ogs_pfcp_subnet_t *subnet = NULL;
-
     ogs_assert(dnn);
-    ogs_assert(family == AF_INET || family == AF_INET6);
 
-    ogs_list_for_each(&self.subnet_list, subnet) {
-        if ((subnet->family == AF_UNSPEC || subnet->family == family) &&
-            (strlen(subnet->dnn) == 0 ||
-                (strlen(subnet->dnn) && ogs_strcasecmp(subnet->dnn, dnn) == 0)) &&
-            subnet->pool.avail)
-            break;
-    }
+    return find_subnet(family, dnn, NULL);
+}
 
-    return subnet;
+ogs_pfcp_subnet_t *ogs_pfcp_find_subnet_by_addr(
+        int family, const char *dnn, const uint8_t *addr)
+{
+    ogs_assert(addr);
+
+    return find_subnet(family, dnn, addr);
 }
 
 void ogs_pfcp_pool_init(ogs_pfcp_sess_t *sess)
