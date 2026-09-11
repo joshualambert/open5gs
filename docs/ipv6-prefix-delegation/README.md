@@ -106,6 +106,58 @@ Both are identical on every re-attach. Keep static blocks outside the dynamic
 `range:` of the pool; as a safety net the UPF refuses a session whose block
 is already owned by another session.
 
+### Worked example: one static block per subscriber, shared by two APNs
+
+Requirement: a subscriber's static `/56` is the same whether the SIM is on
+the `edge` APN (`ogstun2`) or the `public` APN (`ogstun3`); dynamic
+subscribers draw from a per-APN pool. Declare the static region once per
+APN as a `static: true` subnet and keep the dynamic pool separate:
+
+```yaml
+smf:                                  # identical `session:` list in upf.yaml
+  session:
+    # dynamic blocks for edge
+    - subnet: 2602:f815:ff::/48
+      gateway: 2602:f815:ff::1
+      dnn: edge
+      dev: ogstun2
+      prefix_delegation: 56
+    # per-subscriber statics: same region on every APN, different tun
+    - subnet: 2602:f815:f0::/45
+      dnn: edge
+      dev: ogstun2
+      prefix_delegation: 56
+      static: true
+    - subnet: 2602:f815:f0::/45
+      dnn: public
+      dev: ogstun3
+      prefix_delegation: 56
+      static: true
+```
+
+* A `static: true` subnet has no dynamic pool. It is only ever selected by
+  containment of the subscriber's static UE IPv6 address, and it carries its
+  own `prefix_delegation` (it need not match the dynamic pool's).
+  `gateway:` is optional for it.
+* Precedence for a static address: `static: true` subnets of the DNN first,
+  then dynamic subnets of the DNN that contain the address (so today's
+  practice of keeping statics inside a dynamic subnet but outside its
+  `range:` keeps working), then DNN-less subnets in the same order. An
+  address inside no subnet rejects the session with a logged error instead
+  of guessing a pool.
+* For every session in a `static: true` subnet the UPF installs a kernel
+  route for the **block** (`/56` here, not the `/64`) to that subnet's `dev`
+  (rtnetlink, protocol 250, flushed at UPF start, removed at session
+  release). Longest match does the rest: with `2602:f815:f0::1/44` on
+  `ogstun2`, a public-APN session's `/56` route to `ogstun3` wins for that
+  block while it exists.
+* Sticky DHCPv6 bindings are per PDN session and die with it (Release,
+  detach, re-attach, SMF/UPF restart). Under IP passthrough, swapping only the
+  LAN router (new DUID) without the CPE re-attaching leaves the old binding
+  in place until the old router has been silent past T2 (default 0.8 x
+  `preferred_lifetime`, 2880 s) or the binding's `valid_lifetime` expires; a
+  subscriber kick (Cancel-Location → re-attach) clears it immediately.
+
 ### N6 routing
 
 The whole pool subnet (`2001:db8:cafe::/48` above) must be routed to the UPF
