@@ -347,7 +347,7 @@ address to a MAC before it can forward anything; it sends NS to
   accepted **only when the packet matched a PDR whose FAR destination is the
   CP function** (RS, NS-for-gateway, DHCPv6). On any other PDR it is dropped
   in the UPF (`[DROP] Link-local source not for the control plane`) and
-  counted (`upf_metrics`: `ul_drop_link_local`). Nothing link-local ever
+  counted (Prometheus `upf_ul_drop_link_local`, log rate-limited to one line per second). Nothing link-local ever
   reaches `ogstun`.
 * **SMF binding policy** (`smf.dhcpv6.binding_policy: sticky | replace`,
   default `sticky`): while a binding is live (committed and
@@ -410,8 +410,9 @@ interface = the subnet's `dev`). Rules:
 * non-Linux builds log once that per-session routes are unsupported.
 
 Implemented in `src/upf/route.c` (`upf_route_init()`, `upf_route_final()`,
-`upf_route_add(const ogs_ipsubnet_t *prefix, uint8_t prefixlen, const char *ifname)`,
-`upf_route_del(...)`) and called from `upf_sess_set_ue_ip()` /
+`upf_route_add(int family, const uint8_t *prefix, uint8_t prefixlen, const char *ifname)`,
+`upf_route_del(...)`; framed routes always get a kernel route, static-only
+blocks get one too; failures are logged and never fail the session) and called from `upf_sess_set_ue_ip()` /
 `upf_sess_clear_ue_ip()` / framed-route setters.
 
 ### 5.6 Router Advertisement knobs (Defect 6)
