@@ -666,51 +666,68 @@ static void _gtpv1_u_recv_one(ogs_socket_t fd, ogs_sock_t *sock, ogs_pkbuf_t *pk
                 ogs_assert(src_addr);
 
     /*
-     * Discussion #1776 was raised,
-     * but we decided not to allow unspecified addresses
-     * because Open5GS has already sent interface identifiers
-     * in the registgration/attach process.
+     * Uplink IPv6 source address rule
+     * (docs/ipv6-prefix-delegation/DESIGN.md 5.2 and 5.7)
      *
+     * 1. Link-local (fe80::/10, RFC 4291 2.5.6) and unspecified (::,
+     *    RFC 4861 4.1 allows a Router Solicitation from it) sources are
+     *    accepted ONLY when the packet matched a PDR whose FAR forwards to
+     *    the CP function (the UP2CP PDR: Router Solicitation, Neighbour
+     *    Solicitation for the gateway, DHCPv6). The interface identifier is
+     *    not checked: the requesting router behind the UE (a CPE / router
+     *    doing DHCPv6-PD) does not necessarily use the one assigned in the
+     *    attach / registration procedure.
      *
-     * RFC4861
-     * 4.  Message Formats
-     * 4.1.  Router Solicitation Message Format
-     * IP Fields:
-     *    Source Address
-     *                  An IP address assigned to the sending interface, or
-     *                  the unspecified address if no address is assigned
-     *                  to the sending interface.
+     *    On any other PDR such a packet is dropped here. It used to be
+     *    forwarded to the tun device, relying on the kernel not to forward
+     *    a link-local source off-link. That is not good enough: a
+     *    passthrough CPE (seen on a Titan 4000 + TP-Link HX220) leaks its
+     *    LAN link-local traffic onto the bearer (mDNS, ND, DHCPv6 from LAN
+     *    hosts, several fe80:: sources), so anything link-local inside the
+     *    tunnel may come from an untrusted LAN host rather than from the
+     *    subscriber's router. Nothing link-local ever reaches the tun. The
+     *    drop is counted (upf_ul_drop_link_local) and logged at most once
+     *    per second so a chatty LAN cannot flood the log.
      *
-     * 6.1.  Message Validation
-     * 6.1.1.  Validation of Router Solicitation Messages
-     *  Hosts MUST silently discard any received Router Solicitation
-     *  Messages.
+     * 2. Global sources must lie inside the session's network prefix: the
+     *    /64 link prefix, or the whole delegated block (sess->ipv6_prefixlen
+     *    < 64) when IPv6 prefix delegation is in use, or inside one of the
+     *    session's framed routes. Everything else is spoofed and dropped.
      *
-     *  A router MUST silently discard any received Router Solicitation
-     *  messages that do not satisfy all of the following validity checks:
-     *
-     *  ..
-     *  ..
-     *
-     *  - If the IP source address is the unspecified address, there is no
-     *    source link-layer address option in the message.
-     *
-     *
-     * Link-local sources (fe80::/10) are accepted without checking the
-     * interface identifier. Such packets (Router Solicitation, DHCPv6 to
-     * ff02::1:2, ...) either reach the SMF through the UP2CP PDR or,
-     * when forwarded towards N6, are dropped by the kernel because a
-     * link-local address must not be forwarded off-link (RFC 4291 2.5.6).
-     * A CPE / router behind the UE (the DHCPv6-PD requesting router) does
-     * not necessarily use the interface identifier that was assigned in
-     * the attach/registration procedure.
-     *
-     * Global sources must lie inside the session's network prefix: the
-     * /64 link prefix, or the whole delegated block (sess->ipv6_prefixlen
-     * < 64) when IPv6 prefix delegation is in use.
+     * Discussion #1776 originally rejected the unspecified address because
+     * Open5GS has already sent an interface identifier in the attach /
+     * registration procedure; it is now accepted under rule 1 only.
      */
-                if (IN6_IS_ADDR_LINKLOCAL((struct in6_addr *)src_addr)) {
-                    /* Link-local address, see above */
+                if (IN6_IS_ADDR_LINKLOCAL((struct in6_addr *)src_addr) ||
+                    IN6_IS_ADDR_UNSPECIFIED((struct in6_addr *)src_addr)) {
+                    if (far->dst_if != OGS_PFCP_INTERFACE_CP_FUNCTION) {
+                        static ogs_time_t last_logged = 0;
+                        static uint64_t num_dropped = 0;
+                        ogs_time_t now = ogs_get_monotonic_time();
+
+                        num_dropped++;
+                        upf_metrics_inst_global_inc(
+                                UPF_METR_GLOB_CTR_UL_DROP_LINK_LOCAL);
+
+                        if (!last_logged ||
+                            now - last_logged >= ogs_time_from_sec(1)) {
+                            last_logged = now;
+                            ogs_error("[DROP] Link-local source not for the "
+                                    "control plane APN:%s SrcIf:%d DstIf:%d "
+                                    "TEID:0x%x SRC:%08x %08x %08x %08x "
+                                    "(%" PRIu64 " dropped since start)",
+                                    pdr->dnn, pdr->src_if, far->dst_if,
+                                    header_desc.teid,
+                                    be32toh(src_addr[0]),
+                                    be32toh(src_addr[1]),
+                                    be32toh(src_addr[2]),
+                                    be32toh(src_addr[3]),
+                                    num_dropped);
+                        }
+
+                        goto cleanup;
+                    }
+                    /* Towards the SMF through the UP2CP PDR, see above */
                 } else if (upf_ipv6_prefix_match(src_addr,
                             sess->ipv6->addr, sess->ipv6_prefixlen)) {
                     /* Global address inside the /64 or delegated block */

@@ -19,6 +19,8 @@ upf_conf = configuration_data()
 
 upf_headers = ('''
     ifaddrs.h
+    linux/netlink.h
+    linux/rtnetlink.h
     net/ethernet.h
     net/if.h
     net/if_dl.h
@@ -55,6 +57,7 @@ libupf_sources = files('''
     pfcp-path.h
     n4-build.h
     n4-handler.h
+    route.h
 
     rule-match.c
     init.c
@@ -68,6 +71,7 @@ libupf_sources = files('''
     pfcp-path.c
     n4-build.c
     n4-handler.c
+    route.c
 '''.split())
 
 libtins_dep = dependency('libtins',
