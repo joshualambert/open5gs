@@ -509,6 +509,190 @@ static void test_parse_captured_solicit(abts_case *tc, void *data)
 }
 
 /*****************************************************************************
+ * Client fixtures captured on hardware (TP-Link HX220 behind a Titan 4000 in
+ * IP passthrough, 2026-09-11), see docs/ipv6-prefix-delegation/DESIGN.md 5.8
+ *****************************************************************************/
+
+/* DUID-LL, hardware type 1, 2e:2f:d0:b8:f1:9d */
+static const uint8_t hx220_duid[] = {
+    0x00, 0x03, 0x00, 0x01, 0x2e, 0x2f, 0xd0, 0xb8, 0xf1, 0x9d
+};
+
+/*
+ * Information-request xid b8e5d9: CLIENTID, ELAPSED_TIME 0, VENDOR_CLASS
+ * (enterprise 11863 "TP-Link Technology Co.,Ltd"), ORO [32, 23, 16].
+ * Sent by the HX220 even when the RA had O=0.
+ */
+static const char hx220_information_request_hex[] =
+    "0bb8e5d9"
+    "0001000a000300012e2fd0b8f19d"
+    "0008000200000010"
+    "002000002e57001a54502d4c696e6b20546563686e6f6c6f677920436f2e2c4c7464"
+    "00060006002000170010";
+
+/*
+ * Solicit xid c0fa97: CLIENTID, IA_PD (IAID 0xd0b8f19d, T1 = T2 =
+ * 0xffffffff, no IAPREFIX hint), ELAPSED_TIME 0, VENDOR_CLASS, ORO [23, 16].
+ * No Rapid Commit, no PD_EXCLUDE.
+ */
+static const char hx220_solicit_hex[] =
+    "01c0fa97"
+    "0001000a000300012e2fd0b8f19d"
+    "0019000cd0b8f19dffffffffffffffff"
+    "0008000200000010"
+    "002000002e57001a54502d4c696e6b20546563686e6f6c6f677920436f2e2c4c7464"
+    "0006000400170010";
+
+static size_t hex_to_wire(const char *hex, uint8_t *out, size_t max)
+{
+    size_t len = strlen(hex) / 2;
+
+    ogs_assert(len <= max);
+    ogs_assert(ogs_ascii_to_hex_checked(hex, strlen(hex), out, len) == OGS_OK);
+    return len;
+}
+
+/* Common part of both HX220 messages */
+static void check_hx220_common(abts_case *tc, const ogs_dhcpv6_message_t *msg)
+{
+    ABTS_INT_EQUAL(tc, sizeof(hx220_duid), msg->client_id.len);
+    ABTS_TRUE(tc, memcmp(msg->client_id.data, hx220_duid,
+                sizeof(hx220_duid)) == 0);
+    ABTS_INT_EQUAL(tc, 0, msg->server_id.len);
+
+    ABTS_TRUE(tc, msg->elapsed_time.presence == true);
+    ABTS_INT_EQUAL(tc, 0, msg->elapsed_time.value);
+
+    /* VENDOR_CLASS is skipped, the rest is untouched */
+    ABTS_TRUE(tc, ogs_dhcpv6_oro_contains(msg, OGS_DHCPV6_OPTION_DNS_SERVERS));
+    ABTS_TRUE(tc, ogs_dhcpv6_oro_contains(msg, OGS_DHCPV6_OPTION_VENDOR_CLASS));
+    ABTS_TRUE(tc, msg->rapid_commit == false);
+    ABTS_TRUE(tc, msg->reconf_accept == false);
+    ABTS_TRUE(tc, msg->preference.presence == false);
+    ABTS_TRUE(tc, msg->status.presence == false);
+    ABTS_INT_EQUAL(tc, 0, msg->num_of_ia_na);
+    ABTS_TRUE(tc, msg->ia_ta_presence == false);
+    ABTS_INT_EQUAL(tc, 0, msg->num_of_dns);
+    ABTS_INT_EQUAL(tc, 0, msg->sol_max_rt);
+    ABTS_INT_EQUAL(tc, 0, msg->inf_max_rt);
+    ABTS_INT_EQUAL(tc, 0, msg->information_refresh_time);
+}
+
+static void test_hx220_information_request(abts_case *tc, void *data)
+{
+    uint8_t wire[128], rebuilt[128];
+    size_t len;
+    int n;
+    ogs_dhcpv6_message_t msg, again;
+
+    len = hex_to_wire(hx220_information_request_hex, wire, sizeof(wire));
+    ABTS_INT_EQUAL(tc, 70, len);
+    ABTS_INT_EQUAL(tc, OGS_OK, parse_exact(&msg, wire, len));
+
+    ABTS_INT_EQUAL(tc, OGS_DHCPV6_INFORMATION_REQUEST, msg.msg_type);
+    ABTS_INT_EQUAL(tc, 0xb8e5d9, msg.transaction_id);
+    check_hx220_common(tc, &msg);
+
+    ABTS_INT_EQUAL(tc, 3, msg.num_of_oro);
+    ABTS_INT_EQUAL(tc, OGS_DHCPV6_OPTION_INFORMATION_REFRESH_TIME, msg.oro[0]);
+    ABTS_INT_EQUAL(tc, OGS_DHCPV6_OPTION_DNS_SERVERS, msg.oro[1]);
+    ABTS_INT_EQUAL(tc, OGS_DHCPV6_OPTION_VENDOR_CLASS, msg.oro[2]);
+    ABTS_TRUE(tc, ogs_dhcpv6_oro_contains(&msg,
+                OGS_DHCPV6_OPTION_INFORMATION_REFRESH_TIME));
+    ABTS_INT_EQUAL(tc, 0, msg.num_of_ia_pd);
+
+    /* Round trip: VENDOR_CLASS is not re-emitted, everything else is */
+    n = build_exact(&msg, rebuilt, sizeof(rebuilt));
+    ABTS_INT_EQUAL(tc, 70 - 4 - 32, n);
+    ABTS_INT_EQUAL(tc, OGS_OK, parse_exact(&again, rebuilt, n));
+    ABTS_INT_EQUAL(tc, msg.msg_type, again.msg_type);
+    ABTS_INT_EQUAL(tc, msg.transaction_id, again.transaction_id);
+    check_hx220_common(tc, &again);
+    ABTS_INT_EQUAL(tc, 3, again.num_of_oro);
+    ABTS_TRUE(tc, memcmp(msg.oro, again.oro, 3 * sizeof(uint16_t)) == 0);
+}
+
+static void test_hx220_solicit(abts_case *tc, void *data)
+{
+    uint8_t wire[128], rebuilt[128];
+    size_t len;
+    int n;
+    ogs_dhcpv6_message_t msg, again;
+
+    len = hex_to_wire(hx220_solicit_hex, wire, sizeof(wire));
+    ABTS_INT_EQUAL(tc, 84, len);
+    ABTS_INT_EQUAL(tc, OGS_OK, parse_exact(&msg, wire, len));
+
+    ABTS_INT_EQUAL(tc, OGS_DHCPV6_SOLICIT, msg.msg_type);
+    ABTS_INT_EQUAL(tc, 0xc0fa97, msg.transaction_id);
+    check_hx220_common(tc, &msg);
+
+    ABTS_INT_EQUAL(tc, 2, msg.num_of_oro);
+    ABTS_INT_EQUAL(tc, OGS_DHCPV6_OPTION_DNS_SERVERS, msg.oro[0]);
+    ABTS_INT_EQUAL(tc, OGS_DHCPV6_OPTION_VENDOR_CLASS, msg.oro[1]);
+    ABTS_TRUE(tc, !ogs_dhcpv6_oro_contains(&msg, OGS_DHCPV6_OPTION_PD_EXCLUDE));
+
+    ABTS_INT_EQUAL(tc, 1, msg.num_of_ia_pd);
+    ABTS_TRUE(tc, msg.ia_pd[0].iaid == 0xd0b8f19d);
+    ABTS_TRUE(tc, msg.ia_pd[0].t1 == 0xffffffff);
+    ABTS_TRUE(tc, msg.ia_pd[0].t2 == 0xffffffff);
+    ABTS_INT_EQUAL(tc, 0, msg.ia_pd[0].num_of_prefix);
+    ABTS_TRUE(tc, msg.ia_pd[0].status.presence == false);
+
+    n = build_exact(&msg, rebuilt, sizeof(rebuilt));
+    ABTS_INT_EQUAL(tc, 84 - 4 - 32, n);
+    ABTS_INT_EQUAL(tc, OGS_OK, parse_exact(&again, rebuilt, n));
+    ABTS_INT_EQUAL(tc, msg.msg_type, again.msg_type);
+    ABTS_INT_EQUAL(tc, msg.transaction_id, again.transaction_id);
+    check_hx220_common(tc, &again);
+    ABTS_INT_EQUAL(tc, 2, again.num_of_oro);
+    ABTS_TRUE(tc, memcmp(msg.oro, again.oro, 2 * sizeof(uint16_t)) == 0);
+    ABTS_INT_EQUAL(tc, 1, again.num_of_ia_pd);
+    ABTS_TRUE(tc, again.ia_pd[0].iaid == 0xd0b8f19d);
+    ABTS_TRUE(tc, again.ia_pd[0].t1 == 0xffffffff);
+    ABTS_TRUE(tc, again.ia_pd[0].t2 == 0xffffffff);
+    ABTS_INT_EQUAL(tc, 0, again.ia_pd[0].num_of_prefix);
+}
+
+/* RFC 8415 section 21.23: Reply to the Information-request above */
+static void test_information_refresh_time(abts_case *tc, void *data)
+{
+    static const uint8_t expected[] = {
+        /* Reply, xid b8e5d9 */
+        0x07, 0xb8, 0xe5, 0xd9,
+        /* CLIENTID echoed */
+        0x00, 0x01, 0x00, 0x0a,
+        0x00, 0x03, 0x00, 0x01, 0x2e, 0x2f, 0xd0, 0xb8, 0xf1, 0x9d,
+        /* INFORMATION_REFRESH_TIME 86400 */
+        0x00, 0x20, 0x00, 0x04, 0x00, 0x01, 0x51, 0x80,
+    };
+    ogs_dhcpv6_message_t msg, parsed;
+    uint8_t buf[64];
+    int n;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_type = OGS_DHCPV6_REPLY;
+    msg.transaction_id = 0xb8e5d9;
+    msg.client_id.len = sizeof(hx220_duid);
+    memcpy(msg.client_id.data, hx220_duid, sizeof(hx220_duid));
+    msg.information_refresh_time = 86400;
+
+    n = build_exact(&msg, buf, sizeof(buf));
+    ABTS_INT_EQUAL(tc, sizeof(expected), n);
+    ABTS_TRUE(tc, memcmp(buf, expected, sizeof(expected)) == 0);
+
+    ABTS_INT_EQUAL(tc, OGS_OK, parse_exact(&parsed, buf, n));
+    ABTS_INT_EQUAL(tc, 86400, parsed.information_refresh_time);
+    ABTS_INT_EQUAL(tc, 0, parsed.sol_max_rt);
+    ABTS_INT_EQUAL(tc, 0, parsed.inf_max_rt);
+
+    /* 0 means absent: nothing emitted */
+    msg.information_refresh_time = 0;
+    n = build_exact(&msg, buf, sizeof(buf));
+    ABTS_INT_EQUAL(tc, sizeof(expected) - 8, n);
+}
+
+/*****************************************************************************
  * Rejection of malformed input
  *****************************************************************************/
 
@@ -595,6 +779,9 @@ static const uint8_t r_reconf_accept_len1[] = { HDR, OPT(20, 1), 0 };
 static const uint8_t r_dns_len15[] = { HDR, OPT(23, 15), Z8, Z4, 0, 0, 0 };
 static const uint8_t r_sol_max_rt_len3[] = { HDR, OPT(82, 3), 0, 0, 0 };
 static const uint8_t r_inf_max_rt_len5[] = { HDR, OPT(83, 5), 0, 0, 0, 0, 0 };
+static const uint8_t r_refresh_time_len3[] = { HDR, OPT(32, 3), 0, 0, 0 };
+static const uint8_t r_dup_refresh_time[] = {
+    HDR, OPT(32, 4), 0, 1, 0x51, 0x80, OPT(32, 4), 0, 1, 0x51, 0x80 };
 static const uint8_t r_status_len1[] = { HDR, OPT(13, 1), 0 };
 static const uint8_t r_fifth_ia_pd_malformed[] = {
     HDR, OPT(25, 12), IA_PD_HDR, OPT(25, 12), IA_PD_HDR,
@@ -653,6 +840,8 @@ static const struct {
     REJECT_CASE(r_dns_len15),
     REJECT_CASE(r_sol_max_rt_len3),
     REJECT_CASE(r_inf_max_rt_len5),
+    REJECT_CASE(r_refresh_time_len3),
+    REJECT_CASE(r_dup_refresh_time),
     REJECT_CASE(r_status_len1),
     REJECT_CASE(r_fifth_ia_pd_malformed),
     REJECT_CASE(r_trailing_garbage),
@@ -1238,6 +1427,9 @@ abts_suite *test_dhcpv6(abts_suite *suite)
     abts_run_test(suite, test_reply_no_prefix_avail, NULL);
     abts_run_test(suite, test_rfc6603_example, NULL);
     abts_run_test(suite, test_parse_captured_solicit, NULL);
+    abts_run_test(suite, test_hx220_information_request, NULL);
+    abts_run_test(suite, test_hx220_solicit, NULL);
+    abts_run_test(suite, test_information_refresh_time, NULL);
     abts_run_test(suite, test_reject_malformed, NULL);
     abts_run_test(suite, test_limits, NULL);
     abts_run_test(suite, test_truncation, NULL);

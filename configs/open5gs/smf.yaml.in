@@ -68,6 +68,43 @@ smf:
 #                              # client choose)
 #    rapid_commit: true        # answer Solicit + Rapid Commit with a Reply
 #    preference: 0             # OPTION_PREFERENCE (0..255), 0 = not sent
+#    binding_policy: sticky    # sticky|replace. sticky: while the delegation
+#                              # is live (committed, within valid_lifetime and
+#                              # the bound router has been heard from within
+#                              # T2) a Solicit/Request from another DUID gets
+#                              # NoPrefixAvail and a Renew/Rebind NoBinding;
+#                              # the bound router's Release, the lifetime
+#                              # expiry, T2 of silence or a re-attach of the
+#                              # subscriber frees it. replace: any Request
+#                              # takes the prefix over (a leaky passthrough
+#                              # CPE can then let a LAN host steal it).
+#    information_refresh_time: 86400
+#                              # seconds (>= 600) sent in the Reply to an
+#                              # Information-request when asked for
+#                              # (OPTION_INFORMATION_REFRESH_TIME)
+# Router Advertisement sent in answer to a Router Solicitation from the UE.
+# All keys are optional; the defaults below apply when the section is absent.
+# Stock Open5GS behaviour is other_config: false, on_link: true, rdnss: false,
+# source_link_layer_address: false.
+#  router_advertisement:
+#    other_config: auto        # O flag: auto|true|false. auto sets it when
+#                              # the session has a delegated prefix or an
+#                              # IPv6 DNS server is configured (M is always 0)
+#    on_link: false            # L flag of the Prefix Information option;
+#                              # TS 29.061 wants it cleared on a PDN link
+#    rdnss: true               # RFC 8106 RDNSS option carrying the IPv6 `dns`
+#    source_link_layer_address: true
+#                              # Source Link-Layer Address option with the
+#                              # virtual MAC below, so routers behind a
+#                              # passthrough CPE can resolve the gateway
+#    link_layer_address: 02:00:00:00:01:01
+#                              # Virtual MAC of the gateway (RA SLLA and the
+#                              # Target Link-Layer Address of the Neighbor
+#                              # Advertisements the SMF sends). Six hex
+#                              # octets, ':' or '-' separated, unicast; a
+#                              # warning is logged unless it is locally
+#                              # administered (second bit of the first octet)
+#    router_lifetime: 64800    # seconds (0..65535), 0 = not a default router
 #  p-cscf:
 #    - 127.0.0.1
 #    - ::1

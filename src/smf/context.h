@@ -151,6 +151,8 @@ typedef struct smf_context_s {
 
 #define SMF_DHCPV6_DEFAULT_PREFERRED_LIFETIME   3600
 #define SMF_DHCPV6_DEFAULT_VALID_LIFETIME       7200
+#define SMF_DHCPV6_DEFAULT_INFORMATION_REFRESH_TIME 86400
+#define SMF_DHCPV6_MIN_INFORMATION_REFRESH_TIME 600     /* IRT_MINIMUM */
 
     uint16_t        mtu;            /* MTU to advertise in PCO */
 
@@ -166,7 +168,30 @@ typedef struct smf_context_s {
         uint32_t t2;                    /* seconds, 0 = client decides */
         bool rapid_commit;              /* Solicit + Rapid Commit -> Reply */
         uint8_t preference;             /* OPTION_PREFERENCE, 0 = omitted */
+        /* binding_policy: sticky (true) keeps a live binding for its
+         * client and refuses other DUIDs; replace (false) lets any
+         * Request take the prefix over */
+        bool sticky;
+        uint32_t information_refresh_time;  /* seconds, RFC 8415 21.23 */
     } dhcpv6;
+
+#define SMF_RA_DEFAULT_ROUTER_LIFETIME      64800
+#define SMF_RA_OTHER_CONFIG_AUTO            0
+#define SMF_RA_OTHER_CONFIG_TRUE            1
+#define SMF_RA_OTHER_CONFIG_FALSE           2
+
+    /*
+     * Router Advertisement knobs (smf.router_advertisement in smf.yaml),
+     * see docs/ipv6-prefix-delegation/DESIGN.md section 5.6.
+     */
+    struct {
+        int other_config;               /* SMF_RA_OTHER_CONFIG_* (O flag) */
+        bool on_link;                   /* L flag of Prefix Information */
+        bool rdnss;                     /* RFC 8106 RDNSS option */
+        bool source_link_layer_address; /* SLLA option in the RA */
+        uint8_t link_layer_address[6];  /* Virtual MAC (RA SLLA, NA TLLA) */
+        uint16_t router_lifetime;       /* seconds */
+    } router_advertisement;
 
     struct  {
         const char *integrity_protection_indication;
@@ -241,7 +266,11 @@ typedef struct smf_dhcpv6_binding_s {
     ogs_dhcpv6_duid_t client_id; /* DUID of the requesting router */
     uint32_t iaid;
     bool pd_exclude;             /* client supports RFC 6603 */
-    ogs_time_t bound_at;         /* last (re)binding time */
+    ogs_time_t bound_at;         /* last (re)binding time; the binding
+                                    expires at bound_at + valid_lifetime */
+    ogs_time_t last_seen;        /* last valid Request/Renew/Rebind/Release
+                                    from the bound client; a foreign client
+                                    may take over after T2 of silence */
 } smf_dhcpv6_binding_t;
 
 typedef struct smf_pf_s {

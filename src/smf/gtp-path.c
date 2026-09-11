@@ -43,7 +43,12 @@
 #include "s5c-build.h"
 #include "gn-build.h"
 
+#include "metrics.h"
+
 static bool check_if_router_solicit(ogs_pkbuf_t *pkbuf);
+static bool check_if_neighbor_solicit_for_us(ogs_pkbuf_t *pkbuf);
+static void send_neighbor_advertisement(smf_sess_t *sess, uint8_t *ip6_dst);
+
 void smf_gtp_link_local_addr(uint8_t *addr6)
 {
     ogs_sockaddr_t *link_local = ogs_gtp_self()->link_local_addr;
@@ -113,12 +118,25 @@ struct smf_nd_opt_rdnss {
     uint32_t nd_opt_rdnss_lifetime;
 } __attribute__ ((packed));
 
+/* RFC 4861 section 4.6.1 Source/Target Link-Layer Address option (MAC-48) */
+struct smf_nd_opt_lladdr {
+    uint8_t nd_opt_lladdr_type;
+    uint8_t nd_opt_lladdr_len;      /* 1 = 8 octets */
+    uint8_t nd_opt_lladdr_addr[6];
+} __attribute__ ((packed));
+
 /*
- * Router Advertisement per TS 29.061 section 11.2.1.3.2: M=0, O=1 when the
- * UE can obtain something more with DHCPv6 (delegated prefix or DNS
- * servers), a single /64 Prefix Information option with A=1 and L=0 and
- * infinite lifetimes, then MTU and RDNSS. The Prefix Information option
- * stays first: peers (and tests/common/gtpu.c) read it at a fixed offset.
+ * Router Advertisement per TS 29.061 section 11.2.1.3.2 with the knobs of
+ * smf.router_advertisement (DESIGN.md section 5.6): M=0, O as configured
+ * (auto = 1 when the UE can obtain something more with DHCPv6, i.e. a
+ * delegated prefix or DNS servers), a single /64 Prefix Information option
+ * with A=1, L as configured and infinite lifetimes, then MTU, Source
+ * Link-Layer Address (the virtual gateway MAC) and RDNSS. The Prefix
+ * Information option stays first: peers (and tests/common/gtpu.c) read it
+ * at a fixed offset.
+ *
+ * `ip6_dst` is the source of the Router Solicitation; when that is the
+ * unspecified address the RA goes to all-nodes (RFC 4861 section 6.2.6).
  */
 static void send_router_advertisement(smf_sess_t *sess, uint8_t *ip6_dst)
 {
@@ -126,8 +144,11 @@ static void send_router_advertisement(smf_sess_t *sess, uint8_t *ip6_dst)
 
     ogs_pfcp_ue_ip_t *ue_ip = NULL;
     uint8_t dns6[MAX_NUM_OF_DNS][OGS_IPV6_LEN];
-    int num_of_dns6 = 0;
+    int num_of_dns6 = 0, num_of_configured_dns6 = 0;
     uint8_t src[OGS_IPV6_LEN];
+    static const uint8_t all_nodes[OGS_IPV6_LEN] = {
+        0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01 };
+    bool other_config, slla;
 
     size_t size, plen;
     uint8_t *p = NULL;
@@ -136,18 +157,42 @@ static void send_router_advertisement(smf_sess_t *sess, uint8_t *ip6_dst)
     struct nd_opt_prefix_info *prefix = NULL;
 
     ogs_assert(sess);
+    ogs_assert(ip6_dst);
     ue_ip = sess->ipv6;
     ogs_assert(ue_ip);
     ogs_assert(ue_ip->subnet);
 
     smf_gtp_link_local_addr(src);
-    num_of_dns6 = smf_dhcpv6_dns_servers(dns6, MAX_NUM_OF_DNS);
+    num_of_configured_dns6 = smf_dhcpv6_dns_servers(dns6, MAX_NUM_OF_DNS);
+    num_of_dns6 = smf_self()->router_advertisement.rdnss ?
+        num_of_configured_dns6 : 0;
+    slla = smf_self()->router_advertisement.source_link_layer_address;
+
+    switch (smf_self()->router_advertisement.other_config) {
+    case SMF_RA_OTHER_CONFIG_TRUE:
+        other_config = true;
+        break;
+    case SMF_RA_OTHER_CONFIG_FALSE:
+        other_config = false;
+        break;
+    default:
+        /* O=1: DHCPv6 has more (delegated prefix and/or DNS) */
+        other_config =
+            smf_sess_ipv6_prefixlen(sess) < OGS_IPV6_DEFAULT_PREFIX_LEN ||
+            num_of_configured_dns6 > 0;
+        break;
+    }
+
+    if (IN6_IS_ADDR_UNSPECIFIED((const struct in6_addr *)ip6_dst))
+        ip6_dst = (uint8_t *)all_nodes;
 
     ogs_debug("      Build Router Advertisement");
 
     plen = sizeof *advert_h + sizeof *prefix;
     if (smf_self()->mtu)
         plen += sizeof(struct nd_opt_mtu);
+    if (slla)
+        plen += sizeof(struct smf_nd_opt_lladdr);
     if (num_of_dns6)
         plen += sizeof(struct smf_nd_opt_rdnss) + num_of_dns6 * OGS_IPV6_LEN;
     size = sizeof *ip6_h + plen;
@@ -167,20 +212,21 @@ static void send_router_advertisement(smf_sess_t *sess, uint8_t *ip6_dst)
     advert_h->nd_ra_type = ND_ROUTER_ADVERT;
     advert_h->nd_ra_code = 0;
     advert_h->nd_ra_curhoplimit = 64;
-    advert_h->nd_ra_flags_reserved = 0;
-    /* O=1: DHCPv6 has more (delegated prefix and/or DNS), M stays 0 */
-    if (smf_sess_ipv6_prefixlen(sess) < OGS_IPV6_DEFAULT_PREFIX_LEN ||
-        num_of_dns6)
+    advert_h->nd_ra_flags_reserved = 0;     /* M stays 0 */
+    if (other_config)
         advert_h->nd_ra_flags_reserved |= ND_RA_FLAG_OTHER;
-    advert_h->nd_ra_router_lifetime = htobe16(64800);  /* 64800s */
+    advert_h->nd_ra_router_lifetime =
+        htobe16(smf_self()->router_advertisement.router_lifetime);
     advert_h->nd_ra_reachable = 0;
     advert_h->nd_ra_retransmit = 0;
 
     prefix->nd_opt_pi_type = ND_OPT_PREFIX_INFORMATION;
     prefix->nd_opt_pi_len = 4; /* 32bytes */
     prefix->nd_opt_pi_prefix_len = OGS_IPV6_DEFAULT_PREFIX_LEN;
-    /* TS 29.061 section 11.2.1.3.2: A-flag set, L-flag cleared */
+    /* TS 29.061 section 11.2.1.3.2: A-flag set, L-flag cleared by default */
     prefix->nd_opt_pi_flags_reserved = ND_OPT_PI_FLAG_AUTO;
+    if (smf_self()->router_advertisement.on_link)
+        prefix->nd_opt_pi_flags_reserved |= ND_OPT_PI_FLAG_ONLINK;
     prefix->nd_opt_pi_valid_time = htobe32(0xffffffff); /* Infinite */
     prefix->nd_opt_pi_preferred_time = htobe32(0xffffffff); /* Infinite */
     memcpy(prefix->nd_opt_pi_prefix.s6_addr,
@@ -194,6 +240,18 @@ static void send_router_advertisement(smf_sess_t *sess, uint8_t *ip6_dst)
         mtu->nd_opt_mtu_mtu = htobe32(smf_self()->mtu);
 
         p += sizeof *mtu;
+    }
+
+    if (slla) {
+        struct smf_nd_opt_lladdr *lladdr = (struct smf_nd_opt_lladdr *)p;
+
+        lladdr->nd_opt_lladdr_type = ND_OPT_SOURCE_LINKADDR;
+        lladdr->nd_opt_lladdr_len = 1; /* 8bytes */
+        memcpy(lladdr->nd_opt_lladdr_addr,
+                smf_self()->router_advertisement.link_layer_address,
+                sizeof(lladdr->nd_opt_lladdr_addr));
+
+        p += sizeof *lladdr;
     }
 
     if (num_of_dns6) {
@@ -220,6 +278,70 @@ static void send_router_advertisement(smf_sess_t *sess, uint8_t *ip6_dst)
             src, ip6_dst, IPPROTO_ICMPV6, advert_h, plen);
 
     ogs_debug("      Send Router Advertisement");
+    smf_gtp_send_to_ue(sess, pkbuf);
+}
+
+/*
+ * Neighbour Advertisement (RFC 4861 section 4.4 / 7.2.4) answering a
+ * Neighbour Solicitation for the SMF link-local address: unicast to the
+ * solicitor, R=1 (we are a router), S=1 (solicited), O=1 (override), target
+ * = our link-local, Target Link-Layer Address option = the virtual MAC that
+ * the RA advertises as Source Link-Layer Address.
+ */
+static void send_neighbor_advertisement(smf_sess_t *sess, uint8_t *ip6_dst)
+{
+    ogs_pkbuf_t *pkbuf = NULL;
+    uint8_t src[OGS_IPV6_LEN];
+    size_t size, plen;
+    struct ip6_hdr *ip6_h = NULL;
+    struct nd_neighbor_advert *advert_h = NULL;
+    struct smf_nd_opt_lladdr *lladdr = NULL;
+    char buf[OGS_ADDRSTRLEN];
+
+    ogs_assert(sess);
+    ogs_assert(ip6_dst);
+
+    smf_gtp_link_local_addr(src);
+
+    plen = sizeof *advert_h + sizeof *lladdr;
+    size = sizeof *ip6_h + plen;
+
+    pkbuf = ogs_pkbuf_alloc(NULL, OGS_GTPV1U_5GC_HEADER_LEN + size);
+    ogs_assert(pkbuf);
+    ogs_pkbuf_reserve(pkbuf, OGS_GTPV1U_5GC_HEADER_LEN);
+    ogs_pkbuf_put(pkbuf, size);
+    memset(pkbuf->data, 0, pkbuf->len);
+
+    ip6_h = (struct ip6_hdr *)pkbuf->data;
+    advert_h = (struct nd_neighbor_advert *)((uint8_t *)ip6_h + sizeof *ip6_h);
+    lladdr = (struct smf_nd_opt_lladdr *)
+        ((uint8_t *)advert_h + sizeof *advert_h);
+
+    advert_h->nd_na_type = ND_NEIGHBOR_ADVERT;
+    advert_h->nd_na_code = 0;
+    advert_h->nd_na_flags_reserved =
+        ND_NA_FLAG_ROUTER | ND_NA_FLAG_SOLICITED | ND_NA_FLAG_OVERRIDE;
+    memcpy(advert_h->nd_na_target.s6_addr, src, OGS_IPV6_LEN);
+
+    lladdr->nd_opt_lladdr_type = ND_OPT_TARGET_LINKADDR;
+    lladdr->nd_opt_lladdr_len = 1; /* 8bytes */
+    memcpy(lladdr->nd_opt_lladdr_addr,
+            smf_self()->router_advertisement.link_layer_address,
+            sizeof(lladdr->nd_opt_lladdr_addr));
+
+    ip6_h->ip6_flow = htobe32(0x60000000);
+    ip6_h->ip6_plen = htobe16(plen);
+    ip6_h->ip6_nxt = IPPROTO_ICMPV6;
+    ip6_h->ip6_hlim = 0xff;
+    memcpy(ip6_h->ip6_src.s6_addr, src, OGS_IPV6_LEN);
+    memcpy(ip6_h->ip6_dst.s6_addr, ip6_dst, OGS_IPV6_LEN);
+
+    advert_h->nd_na_cksum = ogs_in6_cksum(
+            src, ip6_dst, IPPROTO_ICMPV6, advert_h, plen);
+
+    ogs_debug("      Send Neighbor Advertisement to [%s]",
+            OGS_INET6_NTOP(ip6_dst, buf));
+    smf_metrics_inst_global_inc(SMF_METR_GLOB_CTR_ND_TX_NA);
     smf_gtp_send_to_ue(sess, pkbuf);
 }
 
@@ -401,6 +523,10 @@ static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
             ogs_pkbuf_t *reply = smf_dhcpv6_handle(sess, pkbuf);
             if (reply)
                 smf_gtp_send_to_ue(sess, reply);
+        } else if (sess->ipv6 && check_if_neighbor_solicit_for_us(pkbuf)) {
+            struct ip6_hdr *ip6_h = (struct ip6_hdr *)pkbuf->data;
+            ogs_assert(ip6_h);
+            send_neighbor_advertisement(sess, ip6_h->ip6_src.s6_addr);
         }
     } else {
         ogs_error("[DROP] Invalid GTPU Type [%d]", header_desc.type);
@@ -759,6 +885,12 @@ int smf_gtp2_send_delete_bearer_request(
     return rv;
 }
 
+/*
+ * Router Solicitation (RFC 4861 section 4.1). Only the message type is
+ * looked at, as before; the source may be a link-local address or `::`
+ * (the interface identifier is irrelevant). ICMPv6 directly follows the
+ * IPv6 header, which is what a UE sends.
+ */
 static bool check_if_router_solicit(ogs_pkbuf_t *pkbuf)
 {
     struct ip *ip_h = NULL;
@@ -766,6 +898,9 @@ static bool check_if_router_solicit(ogs_pkbuf_t *pkbuf)
     ogs_assert(pkbuf);
     ogs_assert(pkbuf->len);
     ogs_assert(pkbuf->data);
+
+    if (pkbuf->len < sizeof(struct ip6_hdr) + sizeof(struct icmp6_hdr))
+        return false;
 
     ip_h = (struct ip *)pkbuf->data;
     if (ip_h->ip_v == 6) {
@@ -781,6 +916,81 @@ static bool check_if_router_solicit(ogs_pkbuf_t *pkbuf)
     }
 
     return false;
+}
+
+/*
+ * Neighbour Solicitation for the SMF link-local address (RFC 4861 section
+ * 7.1.1 validation): ICMPv6 right after the IPv6 header, hop limit 255,
+ * code 0, at least 24 octets, valid checksum, target not multicast and
+ * equal to our link-local. Duplicate Address Detection probes (source `::`)
+ * are never answered: the target would be an address of the UE side, and
+ * even for our own address a DAD answer would be wrong. Solicitations for
+ * any other target are silently ignored (the LAN behind a passthrough CPE
+ * leaks its own ND onto the bearer).
+ */
+static bool check_if_neighbor_solicit_for_us(ogs_pkbuf_t *pkbuf)
+{
+    struct ip6_hdr *ip6_h = NULL;
+    struct nd_neighbor_solicit *ns_h = NULL;
+    uint8_t link_local[OGS_IPV6_LEN];
+    size_t plen;
+    char buf[OGS_ADDRSTRLEN];
+
+    ogs_assert(pkbuf);
+    ogs_assert(pkbuf->data);
+
+    if (pkbuf->len < sizeof(struct ip6_hdr) + sizeof(struct icmp6_hdr))
+        return false;
+
+    ip6_h = (struct ip6_hdr *)pkbuf->data;
+    if ((ip6_h->ip6_vfc >> 4) != 6 || ip6_h->ip6_nxt != IPPROTO_ICMPV6)
+        return false;
+
+    ns_h = (struct nd_neighbor_solicit *)(pkbuf->data + sizeof(struct ip6_hdr));
+    if (ns_h->nd_ns_type != ND_NEIGHBOR_SOLICIT)
+        return false;
+
+    /* From here on the packet claims to be an NS: say why it is dropped */
+    plen = be16toh(ip6_h->ip6_plen);
+    if (plen < sizeof(struct nd_neighbor_solicit) ||
+        plen > pkbuf->len - sizeof(struct ip6_hdr)) {
+        ogs_debug("[DROP] NS: invalid payload length[%zu] in [%u] octets",
+                plen, pkbuf->len);
+        return false;
+    }
+    if (ip6_h->ip6_hlim != 255 || ns_h->nd_ns_code != 0) {
+        ogs_debug("[DROP] NS: hop limit[%d] code[%d]",
+                ip6_h->ip6_hlim, ns_h->nd_ns_code);
+        return false;
+    }
+    if (ogs_in6_cksum(ip6_h->ip6_src.s6_addr, ip6_h->ip6_dst.s6_addr,
+                IPPROTO_ICMPV6, ns_h, plen) != 0) {
+        ogs_debug("[DROP] NS: bad ICMPv6 checksum");
+        return false;
+    }
+    if (IN6_IS_ADDR_MULTICAST(&ns_h->nd_ns_target)) {
+        ogs_debug("[DROP] NS: multicast target [%s]",
+                OGS_INET6_NTOP(&ns_h->nd_ns_target, buf));
+        return false;
+    }
+
+    smf_gtp_link_local_addr(link_local);
+    if (memcmp(ns_h->nd_ns_target.s6_addr, link_local, OGS_IPV6_LEN) != 0) {
+        ogs_debug("      NS for [%s] is not for us, ignored",
+                OGS_INET6_NTOP(&ns_h->nd_ns_target, buf));
+        return false;
+    }
+
+    smf_metrics_inst_global_inc(SMF_METR_GLOB_CTR_ND_RX_NS);
+
+    if (IN6_IS_ADDR_UNSPECIFIED(&ip6_h->ip6_src)) {
+        ogs_debug("      DAD probe for our link-local from [::], ignored");
+        return false;
+    }
+
+    ogs_debug("      Neighbor Solicitation for us from [%s]",
+            OGS_INET6_NTOP(&ip6_h->ip6_src, buf));
+    return true;
 }
 
 static void bearer_timeout(ogs_gtp_xact_t *xact, void *data)
