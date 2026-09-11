@@ -353,6 +353,10 @@ cleanup:
  * MME turns that into Attach Reject (EMM cause #17 network failure) and
  * releases the S1 context.  If the attach is accepted instead, the test
  * fails but still tears the session down.
+ *
+ * PDN type IPv6 is requested on purpose: for IPv4v6 the SMF's historical
+ * family fallback downgrades the session to IPv4-only ("No IPv6 subnet ...
+ * only IPv4 assigned") before the containment check can reject it.
  */
 static void attach_epc_expect_reject(abts_case *tc, epc_enb_t *enb,
         const char *msin, uint32_t id_base, const char *static_ipv6)
@@ -362,7 +366,7 @@ static void attach_epc_expect_reject(abts_case *tc, epc_enb_t *enb,
     pd_ctx_t ctx;
 
     if (!attach_epc_begin(tc, enb, msin, id_base,
-                OGS_PDU_SESSION_TYPE_IPV4V6, static_ipv6, &test_ue, &sess)) {
+                OGS_PDU_SESSION_TYPE_IPV6, static_ipv6, &test_ue, &sess)) {
         ue_cleanup(tc, test_ue);
         return;
     }
@@ -397,7 +401,7 @@ static void attach_epc_expect_reject(abts_case *tc, epc_enb_t *enb,
     pd_ctx_init(&ctx, tc, enb->gtpu, test_ue, sess, NULL);
     if (test_ue->s1ap_procedure_code == S1AP_ProcedureCode_id_InitialContextSetup)
         attach_epc_finish(tc, enb, test_ue, sess,
-                OGS_PDU_SESSION_TYPE_IPV4V6, &ctx);
+                OGS_PDU_SESSION_TYPE_IPV6, &ctx);
     detach_epc(tc, enb, &ctx);
 }
 

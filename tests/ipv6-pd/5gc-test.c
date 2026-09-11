@@ -385,6 +385,10 @@ cleanup:
  * (5GSM cause #67, insufficient resources for specific slice and DNN) in a
  * DownlinkNASTransport and stays registered.  If the session is accepted
  * instead, the test fails but still tears it down.
+ *
+ * PDU session type IPv6 is requested on purpose: for IPv4v6 the SMF's
+ * historical family fallback downgrades the session to IPv4-only ("No IPv6
+ * subnet ... only IPv4 assigned") before the containment check can reject.
  */
 static void attach_5gc_expect_reject(abts_case *tc, fgc_gnb_t *gnb,
         const char *msin, uint32_t id_base, const char *static_ipv6)
@@ -394,7 +398,7 @@ static void attach_5gc_expect_reject(abts_case *tc, fgc_gnb_t *gnb,
     pd_ctx_t ctx;
 
     if (!attach_5gc_begin(tc, gnb, msin, id_base,
-                OGS_PDU_SESSION_TYPE_IPV4V6, static_ipv6, &test_ue, &sess)) {
+                OGS_PDU_SESSION_TYPE_IPV6, static_ipv6, &test_ue, &sess)) {
         ue_cleanup(tc, test_ue);
         return;
     }
@@ -425,7 +429,7 @@ static void attach_5gc_expect_reject(abts_case *tc, fgc_gnb_t *gnb,
     if (test_ue->ngap_procedure_code ==
             NGAP_ProcedureCode_id_PDUSessionResourceSetup)
         attach_5gc_finish(tc, gnb, test_ue, sess,
-                OGS_PDU_SESSION_TYPE_IPV4V6, &ctx);
+                OGS_PDU_SESSION_TYPE_IPV6, &ctx);
     detach_5gc(tc, gnb, &ctx);
 }
 
