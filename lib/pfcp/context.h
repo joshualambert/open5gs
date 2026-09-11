@@ -407,6 +407,9 @@ typedef struct ogs_pfcp_subnet_s {
 
     int             family;         /* AF_INET or AF_INET6 */
     uint8_t         prefixlen;      /* prefixlen */
+    bool            static_only;    /* YAML `static: true`: no dynamic pool,
+                                     * statics only, UPF installs per-session
+                                     * kernel routes (DESIGN.md 5.5) */
     uint8_t         pd_prefixlen;   /* IPv6 prefix delegation:
                                        0 = disabled, else 1..63 = length of
                                        the network prefix ("block") given to

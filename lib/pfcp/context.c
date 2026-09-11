@@ -764,6 +764,7 @@ int ogs_pfcp_context_parse_config(const char *local, const char *remote)
                         const char *low[OGS_MAX_NUM_OF_SUBNET_RANGE];
                         const char *high[OGS_MAX_NUM_OF_SUBNET_RANGE];
                         const char *prefix_delegation = NULL;
+                        bool static_only = false;
                         int i, num = 0;
 
                         memset(low, 0, sizeof(low));
@@ -804,6 +805,11 @@ int ogs_pfcp_context_parse_config(const char *local, const char *remote)
                                 dnn = ogs_yaml_iter_value(&subnet_iter);
                             } else if (!strcmp(subnet_key, "dev")) {
                                 dev = ogs_yaml_iter_value(&subnet_iter);
+                            } else if (!strcmp(subnet_key, "static")) {
+                                const char *v = ogs_yaml_iter_value(
+                                        &subnet_iter);
+                                static_only = v && ogs_yaml_iter_bool(
+                                        &subnet_iter);
                             } else if (!strcmp(subnet_key,
                                         "prefix_delegation")) {
                                 prefix_delegation =
@@ -855,6 +861,8 @@ int ogs_pfcp_context_parse_config(const char *local, const char *remote)
                             subnet->range[i].low = low[i];
                             subnet->range[i].high = high[i];
                         }
+
+                        subnet->static_only = static_only;
 
                         if (prefix_delegation) {
                             rv = ogs_pfcp_subnet_set_prefix_delegation(
@@ -2556,6 +2564,11 @@ static void u64_to_ipv6_prefix(uint64_t prefix, uint32_t *addr)
 
 static int ue_pool_generate_ipv6(ogs_pfcp_subnet_t *subnet)
 {
+    if (subnet->static_only) {
+        subnet->pool.size = subnet->pool.avail = 0;
+        return OGS_OK;
+    }
+
     int rv;
     uint8_t prefixlen;
     uint64_t blocksize, blockmask;
@@ -2689,6 +2702,12 @@ int ogs_pfcp_ue_pool_generate(void)
         int rangeindex, num_of_range;
         int poolindex;
         int inc;
+
+        if (subnet->static_only) {
+            /* Statics only (DESIGN.md 5.5): nothing to generate */
+            subnet->pool.size = subnet->pool.avail = 0;
+            continue;
+        }
 
         if (subnet->family == AF_INET) {
             maxbytes = 4;
