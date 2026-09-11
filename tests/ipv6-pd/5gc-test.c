@@ -391,14 +391,15 @@ cleanup:
  * subnet ... only IPv4 assigned") before the containment check can reject.
  */
 static void attach_5gc_expect_reject(abts_case *tc, fgc_gnb_t *gnb,
-        const char *msin, uint32_t id_base, const char *static_ipv6)
+        const char *msin, uint32_t id_base, const char *static_ipv6,
+        uint8_t session_type)
 {
     test_ue_t *test_ue = NULL;
     test_sess_t *sess = NULL;
     pd_ctx_t ctx;
 
     if (!attach_5gc_begin(tc, gnb, msin, id_base,
-                OGS_PDU_SESSION_TYPE_IPV6, static_ipv6, &test_ue, &sess)) {
+                session_type, static_ipv6, &test_ue, &sess)) {
         ue_cleanup(tc, test_ue);
         return;
     }
@@ -648,8 +649,12 @@ static void static_orphan(abts_case *tc, void *data)
     fgc_gnb_t gnb;
 
     gnb_setup(tc, &gnb);
+    /* IPv6-only and IPv4v6: a static IPv6 outside every subnet must be
+     * rejected, never downgraded to IPv4-only */
     attach_5gc_expect_reject(tc, &gnb, FGC_MSIN_1, 0,
-            PD_STATIC_ORPHAN_UE_IPV6);
+            PD_STATIC_ORPHAN_UE_IPV6, OGS_PDU_SESSION_TYPE_IPV6);
+    attach_5gc_expect_reject(tc, &gnb, FGC_MSIN_1, 0,
+            PD_STATIC_ORPHAN_UE_IPV6, OGS_PDU_SESSION_TYPE_IPV4V6);
     gnb_close(&gnb);
 }
 

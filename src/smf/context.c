@@ -2401,6 +2401,27 @@ uint8_t smf_sess_set_ue_ip(smf_sess_t *sess)
         else
             subnet6 = ogs_pfcp_find_subnet_by_dnn(AF_INET6, sess->session.name);
 
+        /*
+         * A static address that no subnet of the DNN contains is a
+         * provisioning error (DESIGN.md 5.3): reject the session instead of
+         * silently downgrading it to the other family.
+         */
+        if (memcmp(sess->session.ue_ip.addr6, zero6, OGS_IPV6_LEN) != 0 &&
+            subnet6 == NULL) {
+            char buf[OGS_ADDRSTRLEN];
+            ogs_error("[%s] Static UE IPv6 %s is not inside any subnet "
+                    "of the DNN, session rejected", sess->session.name,
+                    OGS_INET6_NTOP(sess->session.ue_ip.addr6, buf));
+            return OGS_PFCP_CAUSE_NO_RESOURCES_AVAILABLE;
+        }
+        if (sess->session.ue_ip.addr && subnet == NULL) {
+            char buf[OGS_ADDRSTRLEN];
+            ogs_error("[%s] Static UE IPv4 %s is not inside any subnet "
+                    "of the DNN, session rejected", sess->session.name,
+                    OGS_INET_NTOP(&sess->session.ue_ip.addr, buf));
+            return OGS_PFCP_CAUSE_NO_RESOURCES_AVAILABLE;
+        }
+
         if (subnet != NULL && subnet6 == NULL) {
             sess->session.session_type = OGS_PDU_SESSION_TYPE_IPV4;
             ogs_error("[%s] No IPv6 subnet or set to /63 or /64, "

@@ -359,14 +359,15 @@ cleanup:
  * only IPv4 assigned") before the containment check can reject it.
  */
 static void attach_epc_expect_reject(abts_case *tc, epc_enb_t *enb,
-        const char *msin, uint32_t id_base, const char *static_ipv6)
+        const char *msin, uint32_t id_base, const char *static_ipv6,
+        uint8_t session_type)
 {
     test_ue_t *test_ue = NULL;
     test_sess_t *sess = NULL;
     pd_ctx_t ctx;
 
     if (!attach_epc_begin(tc, enb, msin, id_base,
-                OGS_PDU_SESSION_TYPE_IPV6, static_ipv6, &test_ue, &sess)) {
+                session_type, static_ipv6, &test_ue, &sess)) {
         ue_cleanup(tc, test_ue);
         return;
     }
@@ -619,8 +620,12 @@ static void static_orphan(abts_case *tc, void *data)
     epc_enb_t enb;
 
     enb_setup(tc, &enb);
+    /* IPv6-only and IPv4v6: a static IPv6 outside every subnet must be
+     * rejected, never downgraded to IPv4-only */
     attach_epc_expect_reject(tc, &enb, EPC_MSIN_1, 0,
-            PD_STATIC_ORPHAN_UE_IPV6);
+            PD_STATIC_ORPHAN_UE_IPV6, OGS_PDU_SESSION_TYPE_IPV6);
+    attach_epc_expect_reject(tc, &enb, EPC_MSIN_1, 0,
+            PD_STATIC_ORPHAN_UE_IPV6, OGS_PDU_SESSION_TYPE_IPV4V6);
     enb_close(&enb);
 }
 
