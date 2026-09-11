@@ -21,6 +21,7 @@
 #include "gtp-path.h"
 #include "pfcp-path.h"
 #include "metrics.h"
+#include "route.h"
 
 static ogs_thread_t *thread;
 static void upf_main(void *data);
@@ -74,6 +75,16 @@ int upf_initialize(void)
     rv = upf_gtp_open();
     if (rv != OGS_OK) return rv;
 
+    /*
+     * Per-session kernel routes (DESIGN.md 5.5). Not fatal: without the
+     * netlink socket every route add/del fails with an error log and the
+     * operator has to route static blocks / framed routes by hand.
+     */
+    rv = upf_route_init();
+    if (rv != OGS_OK)
+        ogs_error("upf_route_init() failed; "
+                "per-session kernel routes are disabled");
+
     thread = ogs_thread_create(upf_main, NULL);
     if (!thread) return OGS_ERROR;
 
@@ -95,7 +106,8 @@ void upf_terminate(void)
 
     ogs_metrics_context_close(ogs_metrics_self());
 
-    upf_context_final();
+    upf_context_final();    /* removes the sessions and their routes */
+    upf_route_final();
 
     ogs_pfcp_context_final();
     ogs_gtp_context_final();

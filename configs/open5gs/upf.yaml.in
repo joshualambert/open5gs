@@ -28,6 +28,22 @@ upf:
 # is delegated to the UE with DHCPv6-PD (RFC 8415). Must be 1..63 and not
 # shorter than the subnet; it reduces the pool to one session per /56.
 #      prefix_delegation: 56
+#
+# A subnet reserved for subscribers with a static UE address (WebUI "UE IPv4
+# / IPv6 Address"): no dynamic pool is generated, an address is only ever
+# placed here when this subnet contains it. Because the operator does not
+# put an address covering every static block on the tun device, the UPF
+# installs a kernel route per session (Linux rtnetlink, protocol 250) for the
+# UE address (/32) or IPv6 block (/prefix_delegation) via `dev` when the
+# session is created and removes it with the session; every leftover route
+# with protocol 250 is flushed at start-up. Framed routes get a kernel route
+# the same way on every subnet. Inspect with `ip -6 route show proto 250`
+# (`ip route show proto 250` for IPv4). Requires CAP_NET_ADMIN; without it
+# each route is logged as an error and has to be added by hand.
+#    - subnet: 2001:db8:beef::/48
+#      dev: ogstun2
+#      prefix_delegation: 56
+#      static: true
   metrics:
     server:
       - address: 127.0.0.7

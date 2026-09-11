@@ -76,6 +76,13 @@ upf_metrics_spec_def_t upf_metrics_spec_def_global[_UPF_METR_GLOB_MAX] = {
     .name = "fivegs_upffunction_sm_n4sessionreportsucc",
     .description = "Number of successful N4 session reports",
 },
+[UPF_METR_GLOB_CTR_UL_DROP_LINK_LOCAL] = {
+    .type = OGS_METRICS_METRIC_TYPE_COUNTER,
+    .name = "upf_ul_drop_link_local",
+    .description = "Number of uplink IPv6 packets from a link-local or "
+        "unspecified source dropped because they did not match a PDR "
+        "towards the CP function",
+},
 /* Global Gauges: */
 [UPF_METR_GLOB_GAUGE_UPF_SESSIONNBR] = {
     .type = OGS_METRICS_METRIC_TYPE_GAUGE,

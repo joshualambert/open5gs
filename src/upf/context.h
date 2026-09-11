@@ -160,6 +160,19 @@ typedef struct upf_sess_urr_acc_s {
     } last_report;
 } upf_sess_urr_acc_t;
 
+/*
+ * A kernel route installed for a session (DESIGN.md 5.5): an exact copy of
+ * the arguments given to upf_route_add(), so that removal never has to be
+ * recomputed from session state that may have changed in the meantime.
+ * family == 0 means "nothing installed".
+ */
+typedef struct upf_sess_kroute_s {
+    int             family;             /* AF_INET, AF_INET6 or 0 */
+    uint8_t         prefix[OGS_IPV6_LEN];
+    uint8_t         prefixlen;
+    char            ifname[OGS_MAX_IFNAME_LEN];
+} upf_sess_kroute_t;
+
 #define UPF_SESS(pfcp_sess) ogs_container_of(pfcp_sess, upf_sess_t, pfcp)
 typedef struct upf_sess_s {
     ogs_lnode_t     lnode;
@@ -190,6 +203,16 @@ typedef struct upf_sess_s {
 
     ogs_ipsubnet_t   *ipv4_framed_routes;
     ogs_ipsubnet_t   *ipv6_framed_routes;
+
+    /*
+     * Kernel routes owned by this session: the UE address (/32) or IPv6
+     * block (/ipv6_prefixlen) when its subnet is `static: true`, and one
+     * per framed route (slot i belongs to ipvX_framed_routes[i]).
+     */
+    upf_sess_kroute_t ipv4_kroute;
+    upf_sess_kroute_t ipv6_kroute;
+    upf_sess_kroute_t ipv4_framed_kroutes[OGS_MAX_NUM_OF_FRAMED_ROUTES_IN_PDI];
+    upf_sess_kroute_t ipv6_framed_kroutes[OGS_MAX_NUM_OF_FRAMED_ROUTES_IN_PDI];
 
     char            *gx_sid;            /* Gx Session ID */
     ogs_pfcp_node_t *pfcp_node;

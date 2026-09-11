@@ -19,6 +19,7 @@
 
 #include "context.h"
 #include "pfcp-path.h"
+#include "route.h"
 
 static upf_context_t self;
 
@@ -112,9 +113,143 @@ upf_context_t *upf_self(void)
     return &self;
 }
 
+/*
+ * Per-session kernel routes (DESIGN.md 5.5). A failure is logged by
+ * upf_route_add() and leaves kroute->family == 0; the session is not
+ * affected. Only a successfully installed route is recorded, so that
+ * upf_sess_kroute_del() removes exactly what was added.
+ */
+static void upf_sess_kroute_add(upf_sess_kroute_t *kroute,
+        int family, const uint8_t *prefix, uint8_t prefixlen,
+        const char *ifname)
+{
+    ogs_assert(kroute);
+    ogs_assert(prefix);
+    ogs_assert(ifname);
+    ogs_assert(family == AF_INET || family == AF_INET6);
+
+    memset(kroute, 0, sizeof(*kroute));
+
+    if (upf_route_add(family, prefix, prefixlen, ifname) != OGS_OK)
+        return;
+
+    kroute->family = family;
+    memcpy(kroute->prefix, prefix,
+            family == AF_INET ? OGS_IPV4_LEN : OGS_IPV6_LEN);
+    kroute->prefixlen = prefixlen;
+    ogs_cpystrn(kroute->ifname, ifname, sizeof(kroute->ifname));
+}
+
+static void upf_sess_kroute_del(upf_sess_kroute_t *kroute)
+{
+    ogs_assert(kroute);
+
+    if (!kroute->family)
+        return;
+
+    upf_route_del(kroute->family, kroute->prefix, kroute->prefixlen,
+            kroute->ifname);
+    memset(kroute, 0, sizeof(*kroute));
+}
+
+/* Number of leading one bits in the mask of an ogs_ipsubnet_t */
+static uint8_t upf_ipsubnet_prefixlen(const ogs_ipsubnet_t *route)
+{
+    int words = route->family == AF_INET ? 1 : 4;
+    uint8_t prefixlen = 0;
+    int i;
+
+    for (i = 0; i < words; i++) {
+        uint32_t mask = be32toh(route->mask[i]);
+        while (mask & 0x80000000) {
+            prefixlen++;
+            mask <<= 1;
+        }
+        if (mask)
+            break;
+    }
+
+    return prefixlen;
+}
+
+/*
+ * Output device for a framed route of the given family: the tun of the
+ * session's address of that family, or of the other family when the
+ * session has no address of its own family (the traffic still has to
+ * reach this session's tun).
+ */
+static ogs_pfcp_dev_t *upf_sess_dev_for_family(upf_sess_t *sess, int family)
+{
+    ogs_pfcp_ue_ip_t *ue_ip = family == AF_INET ? sess->ipv4 : sess->ipv6;
+
+    if (!ue_ip)
+        ue_ip = family == AF_INET ? sess->ipv6 : sess->ipv4;
+    if (!ue_ip || !ue_ip->subnet)
+        return NULL;
+
+    return ue_ip->subnet->dev;
+}
+
+static void upf_sess_framed_kroute_add(upf_sess_t *sess,
+        upf_sess_kroute_t *kroute, const ogs_ipsubnet_t *route)
+{
+    ogs_pfcp_dev_t *dev = NULL;
+    char buf[OGS_ADDRSTRLEN];
+
+    ogs_assert(sess);
+    ogs_assert(kroute);
+    ogs_assert(route);
+
+    dev = upf_sess_dev_for_family(sess, route->family);
+    if (!dev) {
+        ogs_warn("No tun device for framed route %s/%d "
+                "F-SEID[UP:0x%lx CP:0x%lx]; no kernel route installed",
+                inet_ntop(route->family, route->sub, buf, sizeof(buf)) ?
+                    buf : "?",
+                upf_ipsubnet_prefixlen(route),
+                (long)sess->upf_n4_seid, (long)sess->smf_n4_f_seid.seid);
+        return;
+    }
+
+    upf_sess_kroute_add(kroute, route->family, (const uint8_t *)route->sub,
+            upf_ipsubnet_prefixlen(route), dev->ifname);
+}
+
+/*
+ * Routes for the UE address (IPv4 /32) and the IPv6 block when the subnet
+ * they come from is `static: true`: such a subnet has no address on the
+ * tun that covers the subscriber blocks, so the kernel needs a route per
+ * session to deliver downlink traffic to the tun.
+ */
+static void upf_sess_ue_ip_kroute_add(upf_sess_t *sess)
+{
+    ogs_pfcp_subnet_t *subnet = NULL;
+
+    ogs_assert(sess);
+
+    if (sess->ipv4 && (subnet = sess->ipv4->subnet) != NULL &&
+        subnet->static_only && subnet->dev)
+        upf_sess_kroute_add(&sess->ipv4_kroute, AF_INET,
+                (const uint8_t *)sess->ipv4->addr, OGS_IPV4_LEN << 3,
+                subnet->dev->ifname);
+
+    if (sess->ipv6 && (subnet = sess->ipv6->subnet) != NULL &&
+        subnet->static_only && subnet->dev) {
+        /* upf_route_add() masks the address to the block length */
+        ogs_assert(sess->ipv6_prefixlen > 0);
+        ogs_assert(sess->ipv6_prefixlen <= OGS_IPV6_DEFAULT_PREFIX_LEN);
+        upf_sess_kroute_add(&sess->ipv6_kroute, AF_INET6,
+                (const uint8_t *)sess->ipv6->addr, sess->ipv6_prefixlen,
+                subnet->dev->ifname);
+    }
+}
+
 static void upf_sess_clear_ue_ip(upf_sess_t *sess)
 {
     ogs_assert(sess);
+
+    upf_sess_kroute_del(&sess->ipv4_kroute);
+    upf_sess_kroute_del(&sess->ipv6_kroute);
 
     if (sess->ipv4) {
         ogs_hash_unset_if_owner(self.ipv4_hash,
@@ -614,6 +749,7 @@ uint8_t upf_sess_set_ue_ip(upf_sess_t *sess,
     char buf1[OGS_ADDRSTRLEN];
     char buf2[OGS_ADDRSTRLEN];
     char pd[8];
+    char route[OGS_MAX_IFNAME_LEN * 2 + 16];
 
     uint8_t cause_value = OGS_PFCP_CAUSE_REQUEST_ACCEPTED;
 
@@ -710,17 +846,34 @@ uint8_t upf_sess_set_ue_ip(upf_sess_t *sess,
         return OGS_PFCP_CAUSE_SERVICE_NOT_SUPPORTED;
     }
 
+    /* Kernel routes for `static: true` subnets (DESIGN.md 5.5) */
+    upf_sess_ue_ip_kroute_add(sess);
+
     /* Only a delegated block (shorter than /64) is shown in the log */
     pd[0] = 0;
     if (sess->ipv6 && sess->ipv6_prefixlen < OGS_IPV6_DEFAULT_PREFIX_LEN)
         ogs_snprintf(pd, sizeof(pd), "/%d", sess->ipv6_prefixlen);
 
+    /* " route[dev]" when a kernel route was installed for the address */
+    route[0] = 0;
+    if (sess->ipv4_kroute.family && sess->ipv6_kroute.family &&
+        strcmp(sess->ipv4_kroute.ifname, sess->ipv6_kroute.ifname) != 0)
+        ogs_snprintf(route, sizeof(route), " route[%s,%s]",
+                sess->ipv4_kroute.ifname, sess->ipv6_kroute.ifname);
+    else if (sess->ipv6_kroute.family)
+        ogs_snprintf(route, sizeof(route), " route[%s]",
+                sess->ipv6_kroute.ifname);
+    else if (sess->ipv4_kroute.family)
+        ogs_snprintf(route, sizeof(route), " route[%s]",
+                sess->ipv4_kroute.ifname);
+
     ogs_info("UE F-SEID[UP:0x%lx CP:0x%lx] "
-             "APN[%s] PDN-Type[%d] IPv4[%s] IPv6[%s%s]",
+             "APN[%s] PDN-Type[%d] IPv4[%s] IPv6[%s%s]%s",
         (long)sess->upf_n4_seid, (long)sess->smf_n4_f_seid.seid,
         pdr->dnn, session_type,
         sess->ipv4 ? OGS_INET_NTOP(&sess->ipv4->addr, buf1) : "",
-        sess->ipv6 ? OGS_INET6_NTOP(&sess->ipv6->addr, buf2) : "", pd);
+        sess->ipv6 ? OGS_INET6_NTOP(&sess->ipv6->addr, buf2) : "", pd,
+        route);
 
     return cause_value;
 }
@@ -824,8 +977,9 @@ uint8_t upf_sess_set_ue_ipv4_framed_routes(upf_sess_t *sess,
     ogs_assert(sess);
 
     for (i = 0; i < OGS_MAX_NUM_OF_FRAMED_ROUTES_IN_PDI; i++) {
+        upf_sess_kroute_del(&sess->ipv4_framed_kroutes[i]);
         if (!sess->ipv4_framed_routes || !sess->ipv4_framed_routes[i].family)
-            break;
+            continue;
         free_framed_route_from_trie(&sess->ipv4_framed_routes[i]);
         memset(&sess->ipv4_framed_routes[i], 0,
                sizeof(sess->ipv4_framed_routes[i]));
@@ -850,6 +1004,8 @@ uint8_t upf_sess_set_ue_ipv4_framed_routes(upf_sess_t *sess,
             continue;
         }
         add_framed_route_to_trie(&sess->ipv4_framed_routes[j], sess);
+        upf_sess_framed_kroute_add(sess, &sess->ipv4_framed_kroutes[j],
+                &sess->ipv4_framed_routes[j]);
         j++;
     }
     if (j == 0 && sess->ipv4_framed_routes) {
@@ -869,9 +1025,12 @@ uint8_t upf_sess_set_ue_ipv6_framed_routes(upf_sess_t *sess,
     ogs_assert(sess);
 
     for (i = 0; i < OGS_MAX_NUM_OF_FRAMED_ROUTES_IN_PDI; i++) {
+        upf_sess_kroute_del(&sess->ipv6_framed_kroutes[i]);
         if (!sess->ipv6_framed_routes || !sess->ipv6_framed_routes[i].family)
-            break;
+            continue;
         free_framed_route_from_trie(&sess->ipv6_framed_routes[i]);
+        memset(&sess->ipv6_framed_routes[i], 0,
+               sizeof(sess->ipv6_framed_routes[i]));
     }
 
     for (i = 0, j = 0; i < OGS_MAX_NUM_OF_FRAMED_ROUTES_IN_PDI; i++) {
@@ -893,6 +1052,8 @@ uint8_t upf_sess_set_ue_ipv6_framed_routes(upf_sess_t *sess,
             continue;
         }
         add_framed_route_to_trie(&sess->ipv6_framed_routes[j], sess);
+        upf_sess_framed_kroute_add(sess, &sess->ipv6_framed_kroutes[j],
+                &sess->ipv6_framed_routes[j]);
         j++;
     }
     if (j == 0 && sess->ipv6_framed_routes) {
