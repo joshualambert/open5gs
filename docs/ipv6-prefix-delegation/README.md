@@ -225,13 +225,16 @@ tools that only read the first option are unaffected.
   (RFC 8168) are accepted but the size is operator policy.
 * **IP passthrough / bridge mode CPEs** (for example Nokia FastMile 5G
   gateways in IP passthrough towards a LAN router): the LAN router is the
-  DHCPv6 client. The UPF accepts DHCPv6 from any link-local source inside the
-  tunnel, so the router does not need to use the 3GPP-assigned interface
-  identifier. Renew traffic is unicast to the SMF link-local address that
+  DHCPv6 client. The UPF accepts RS, NS for the gateway and DHCPv6 from any link-local
+  source inside the tunnel (control-plane rules only; every other link-local
+  packet is dropped and counted), so the router does not need to use the
+  3GPP-assigned interface identifier. Renew traffic is unicast to the SMF link-local address that
   sourced the RA; the UPF steers it to the SMF as well.
 * Clients that lose state and Solicit again get the same prefix (it belongs
-  to the PDN connection, not to the DUID); a client with a new DUID replaces
-  the old binding, which is logged.
+  to the PDN connection, not to the DUID); with the default
+  `dhcpv6.binding_policy: sticky` a *different* DUID is refused while the
+  bound client is alive (seen within T2, valid lifetime not expired); set
+  `replace` to let a new DUID take over immediately (logged either way).
 
 ## Logging and troubleshooting
 

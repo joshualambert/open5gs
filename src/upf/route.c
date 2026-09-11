@@ -70,23 +70,32 @@ static int nl_fd = -1;
 static uint32_t nl_seq = 0;
 static char *nl_buf = NULL;
 
-static int nl_addattr(struct nlmsghdr *n, size_t maxlen, int type,
+/*
+ * Append one rtattr to the request. The attribute pointer is derived from
+ * the request object itself, not from its `n` member: taking it through
+ * `&req->n` makes gcc 15's object-size tracking treat the destination as the
+ * 16-byte nlmsghdr and reject the memcpy with -Werror=stringop-overflow.
+ * The bound is the whole request, so an oversized attribute is refused, not
+ * overflowed.
+ */
+static int nl_addattr(upf_route_req_t *req, int type,
         const void *data, size_t alen)
 {
     size_t len = RTA_LENGTH(alen);
+    size_t off = NLMSG_ALIGN(req->n.nlmsg_len);
     struct rtattr *rta = NULL;
 
-    if (NLMSG_ALIGN(n->nlmsg_len) + RTA_ALIGN(len) > maxlen) {
+    if (off + RTA_ALIGN(len) > sizeof(*req)) {
         ogs_error("netlink attribute %d does not fit", type);
         return OGS_ERROR;
     }
 
-    rta = (struct rtattr *)(((char *)n) + NLMSG_ALIGN(n->nlmsg_len));
+    rta = (struct rtattr *)((char *)req + off);
     rta->rta_type = type;
     rta->rta_len = len;
     if (alen)
         memcpy(RTA_DATA(rta), data, alen);
-    n->nlmsg_len = NLMSG_ALIGN(n->nlmsg_len) + RTA_ALIGN(len);
+    req->n.nlmsg_len = off + RTA_ALIGN(len);
 
     return OGS_OK;
 }
@@ -263,11 +272,11 @@ static int nl_route_request(uint16_t type, int family,
     else
         req.r.rtm_scope = RT_SCOPE_NOWHERE;
 
-    rv = nl_addattr(&req.n, sizeof(req), RTA_DST, dst, addrlen);
+    rv = nl_addattr(&req, RTA_DST, dst, addrlen);
     if (rv != OGS_OK)
         return EINVAL;
     if (ifindex) {
-        rv = nl_addattr(&req.n, sizeof(req), RTA_OIF,
+        rv = nl_addattr(&req, RTA_OIF,
                 &ifindex, sizeof(ifindex));
         if (rv != OGS_OK)
             return EINVAL;
