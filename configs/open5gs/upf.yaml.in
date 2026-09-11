@@ -91,3 +91,31 @@ upf:
 #    - subnet: 2001:db8:babe::/48
 #      dnn: ims
 #      dev: ogstun3
+#
+#  o Subnet selection
+#   An address handed over by the SMF is attached to the subnet of the DNN
+#   whose network contains it: 'static: true' subnets are tried before the
+#   dynamic ones, and within each group subnets with a matching 'dnn' before
+#   subnets without 'dnn', each in the order listed here. The subnet decides
+#   the 'dev' the traffic leaves on. If no subnet of the DNN contains the
+#   address the session is rejected. Addresses allocated by the UPF itself
+#   come from the first dynamic subnet of the DNN (matching 'dnn' first,
+#   then without 'dnn') that still has a free entry, so a DNN may list
+#   several non-contiguous pools.
+#
+#  o Static-only subnet
+#   'static: true' declares a subnet without a dynamic pool; it is only used
+#   for static subscriber addresses inside it (with its own
+#   'prefix_delegation', 'gateway' optional) and the UPF installs a kernel
+#   route for each such session towards 'dev'. It may be nested inside a
+#   dynamic subnet and may be listed under several DNNs with different
+#   'dev's.
+#  session:
+#    - subnet: 2001:db8:cafe::/48
+#      gateway: 2001:db8:cafe::1
+#      prefix_delegation: 56
+#      dev: ogstun2
+#    - subnet: 2001:db8:e1::/48
+#      prefix_delegation: 56
+#      dev: ogstun2
+#      static: true

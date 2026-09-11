@@ -679,6 +679,469 @@ static void test_yaml_prefix_delegation(abts_case *tc, void *data)
     ogs_app()->file = NULL;
 }
 
+/*
+ * Subnet selection (DESIGN.md 5.3 - 5.5): static addresses land in the
+ * subnet that contains them, dynamic allocation walks the pools of a DNN.
+ */
+
+static void ipv4_addr(abts_case *tc, const char *str, uint32_t *addr4)
+{
+    int rv;
+    ogs_ipsubnet_t ip4;
+
+    rv = ogs_ipsubnet(&ip4, str, NULL);
+    ABTS_INT_EQUAL(tc, OGS_OK, rv);
+    *addr4 = ip4.sub[0];
+}
+
+static ogs_pfcp_subnet_t *add_subnet6(abts_case *tc,
+        const char *ipstr, const char *numbits, const char *gateway,
+        const char *dnn, const char *pd)
+{
+    int rv;
+    ogs_pfcp_subnet_t *subnet = NULL;
+
+    subnet = ogs_pfcp_subnet_add(ipstr, numbits, gateway, dnn, "ogstun");
+    ABTS_PTR_NOTNULL(tc, subnet);
+    if (pd) {
+        rv = ogs_pfcp_subnet_set_prefix_delegation(subnet, pd);
+        ABTS_INT_EQUAL(tc, OGS_OK, rv);
+    }
+
+    return subnet;
+}
+
+/* Static IPv6 allocation that must succeed in `expected` */
+static ogs_pfcp_ue_ip_t *alloc_static6(abts_case *tc, const char *dnn,
+        const char *str, ogs_pfcp_subnet_t *expected, int prefixlen)
+{
+    uint8_t cause = 0;
+    uint8_t addr6[OGS_IPV6_LEN];
+    ogs_pfcp_ue_ip_t *ue_ip = NULL;
+
+    ipv6_addr(tc, str, addr6);
+    ue_ip = ogs_pfcp_ue_ip_alloc(&cause, AF_INET6, dnn, addr6);
+    ABTS_PTR_NOTNULL(tc, ue_ip);
+    if (!ue_ip)
+        return NULL;
+
+    ABTS_PTR_EQUAL(tc, expected, ue_ip->subnet);
+    ABTS_TRUE(tc, ue_ip->static_ip == true);
+    ABTS_TRUE(tc, memcmp(ue_ip->addr, addr6, OGS_IPV6_LEN) == 0);
+    ABTS_INT_EQUAL(tc, prefixlen, ogs_pfcp_ue_ip_prefixlen(ue_ip));
+
+    return ue_ip;
+}
+
+/* Static IPv6 allocation that must be rejected */
+static void reject_static6(abts_case *tc, const char *dnn, const char *str)
+{
+    uint8_t cause = 0;
+    uint8_t addr6[OGS_IPV6_LEN];
+    ogs_pfcp_ue_ip_t *ue_ip = NULL;
+
+    ipv6_addr(tc, str, addr6);
+    ue_ip = ogs_pfcp_ue_ip_alloc(&cause, AF_INET6, dnn, addr6);
+    ABTS_PTR_EQUAL(tc, NULL, ue_ip);
+    ABTS_INT_EQUAL(tc, OGS_PFCP_CAUSE_NO_RESOURCES_AVAILABLE, cause);
+    ABTS_PTR_EQUAL(tc, NULL,
+            ogs_pfcp_find_subnet_by_addr(AF_INET6, dnn, addr6));
+}
+
+static ogs_pfcp_ue_ip_t *alloc_static4(abts_case *tc, const char *dnn,
+        const char *str, ogs_pfcp_subnet_t *expected)
+{
+    uint8_t cause = 0;
+    uint32_t addr4;
+    ogs_pfcp_ue_ip_t *ue_ip = NULL;
+
+    ipv4_addr(tc, str, &addr4);
+    ue_ip = ogs_pfcp_ue_ip_alloc(&cause, AF_INET, dnn, (uint8_t *)&addr4);
+    ABTS_PTR_NOTNULL(tc, ue_ip);
+    if (!ue_ip)
+        return NULL;
+
+    ABTS_PTR_EQUAL(tc, expected, ue_ip->subnet);
+    ABTS_TRUE(tc, ue_ip->static_ip == true);
+    ABTS_TRUE(tc, ue_ip->addr[0] == addr4);
+
+    return ue_ip;
+}
+
+static void reject_static4(abts_case *tc, const char *dnn, const char *str)
+{
+    uint8_t cause = 0;
+    uint32_t addr4;
+    ogs_pfcp_ue_ip_t *ue_ip = NULL;
+
+    ipv4_addr(tc, str, &addr4);
+    ue_ip = ogs_pfcp_ue_ip_alloc(&cause, AF_INET, dnn, (uint8_t *)&addr4);
+    ABTS_PTR_EQUAL(tc, NULL, ue_ip);
+    ABTS_INT_EQUAL(tc, OGS_PFCP_CAUSE_NO_RESOURCES_AVAILABLE, cause);
+}
+
+/* Dynamic allocation that must come from `expected` */
+static ogs_pfcp_ue_ip_t *alloc_dynamic(abts_case *tc, int family,
+        const char *dnn, ogs_pfcp_subnet_t *expected)
+{
+    uint8_t cause = 0;
+    uint8_t zero[OGS_IPV6_LEN];
+    ogs_pfcp_ue_ip_t *ue_ip = NULL;
+
+    memset(zero, 0, sizeof zero);
+    ue_ip = ogs_pfcp_ue_ip_alloc(&cause, family, dnn, zero);
+    ABTS_PTR_NOTNULL(tc, ue_ip);
+    if (!ue_ip)
+        return NULL;
+
+    ABTS_PTR_EQUAL(tc, expected, ue_ip->subnet);
+    ABTS_TRUE(tc, ue_ip->static_ip == false);
+
+    return ue_ip;
+}
+
+static void reject_dynamic(abts_case *tc, int family, const char *dnn)
+{
+    uint8_t cause = 0;
+    uint8_t zero[OGS_IPV6_LEN];
+    ogs_pfcp_ue_ip_t *ue_ip = NULL;
+
+    memset(zero, 0, sizeof zero);
+    ue_ip = ogs_pfcp_ue_ip_alloc(&cause, family, dnn, zero);
+    ABTS_PTR_EQUAL(tc, NULL, ue_ip);
+    ABTS_INT_EQUAL(tc, OGS_PFCP_CAUSE_NO_RESOURCES_AVAILABLE, cause);
+}
+
+/* Defect 3: a static address lands in the subnet that contains it */
+static void test_alloc_static_containing_subnet(abts_case *tc, void *data)
+{
+    int rv;
+    ogs_pfcp_subnet_t *cafe = NULL, *beef = NULL, *v4a = NULL, *v4b = NULL;
+    ogs_pfcp_ue_ip_t *ue_ip = NULL;
+    uint8_t addr6[OGS_IPV6_LEN];
+
+    cafe = add_subnet6(tc, "2001:db8:cafe::", "48", "2001:db8:cafe::1",
+            "internet", "56");
+    beef = add_subnet6(tc, "2001:db8:beef::", "48", "2001:db8:beef::1",
+            "internet", "60");
+    v4a = ogs_pfcp_subnet_add("10.45.0.0", "16", "10.45.0.1",
+            "internet", "ogstun");
+    ABTS_PTR_NOTNULL(tc, v4a);
+    v4b = ogs_pfcp_subnet_add("10.46.0.0", "16", "10.46.0.1",
+            "internet", "ogstun");
+    ABTS_PTR_NOTNULL(tc, v4b);
+
+    rv = ogs_pfcp_ue_pool_generate();
+    ABTS_INT_EQUAL(tc, OGS_OK, rv);
+
+    /* Second subnet of the DNN: containment decides, not list order */
+    ue_ip = alloc_static6(tc, "internet", "2001:db8:beef:1200::1", beef, 60);
+    if (ue_ip) ogs_pfcp_ue_ip_free(ue_ip);
+    ue_ip = alloc_static6(tc, "internet", "2001:db8:cafe:4200::1", cafe, 56);
+    if (ue_ip) ogs_pfcp_ue_ip_free(ue_ip);
+
+    /* DNN match is case-insensitive, as for dynamic allocation */
+    ue_ip = alloc_static6(tc, "Internet", "2001:db8:beef:1200::1", beef, 60);
+    if (ue_ip) ogs_pfcp_ue_ip_free(ue_ip);
+
+    /* Static entries never touch the pools */
+    ABTS_INT_EQUAL(tc, cafe->pool.size, cafe->pool.avail);
+    ABTS_INT_EQUAL(tc, beef->pool.size, beef->pool.avail);
+
+    /* Not inside any subnet: rejected, no silent fallback */
+    reject_static6(tc, "internet", "2001:db8:dead::1");
+    /* Inside a subnet of another DNN: rejected as well */
+    reject_static6(tc, "ims", "2001:db8:beef:1200::1");
+    /* No DNN and no DNN-less subnet: rejected */
+    reject_static6(tc, NULL, "2001:db8:beef:1200::1");
+
+    /* The subnet lookup itself */
+    ipv6_addr(tc, "2001:db8:beef:ffff::1", addr6);
+    ABTS_PTR_EQUAL(tc, beef,
+            ogs_pfcp_find_subnet_by_addr(AF_INET6, "internet", addr6));
+    ipv6_addr(tc, "2001:db8:cafe:ffff::1", addr6);
+    ABTS_PTR_EQUAL(tc, cafe,
+            ogs_pfcp_find_subnet_by_addr(AF_INET6, "internet", addr6));
+    ipv6_addr(tc, "2001:db8:caff::1", addr6);
+    ABTS_PTR_EQUAL(tc, NULL,
+            ogs_pfcp_find_subnet_by_addr(AF_INET6, "internet", addr6));
+
+    /* IPv4 analogue */
+    ue_ip = alloc_static4(tc, "internet", "10.46.0.7", v4b);
+    if (ue_ip) ogs_pfcp_ue_ip_free(ue_ip);
+    ue_ip = alloc_static4(tc, "internet", "10.45.200.3", v4a);
+    if (ue_ip) ogs_pfcp_ue_ip_free(ue_ip);
+    reject_static4(tc, "internet", "10.47.0.1");
+    reject_static4(tc, "ims", "10.46.0.7");
+    ABTS_INT_EQUAL(tc, v4a->pool.size, v4a->pool.avail);
+    ABTS_INT_EQUAL(tc, v4b->pool.size, v4b->pool.avail);
+
+    ogs_pfcp_subnet_remove_all();
+}
+
+/* Defect 5: `static: true` subnets have no pool and win by containment */
+static void test_alloc_static_only(abts_case *tc, void *data)
+{
+    int rv, i;
+    yaml_document_t *document = NULL;
+    ogs_pfcp_subnet_t *subnet = NULL;
+    ogs_pfcp_subnet_t *dyn = NULL, *nested = NULL, *own = NULL;
+    ogs_pfcp_ue_ip_t *ue_ip = NULL;
+    ogs_pfcp_ue_ip_t *dynamic[TEST_POOL_SESS];
+
+    /*
+     * dyn    2001:db8:cafe::/48      pd 56  dynamic pool
+     * nested 2001:db8:cafe:4000::/50 pd 60  static: true, inside dyn
+     * own    2001:db8:e1::/48        pd 56  static: true, own space,
+     *                                       no gateway (optional)
+     */
+    static const char *yaml =
+        "smf:\n"
+        "  pfcp:\n"
+        "    server:\n"
+        "      - address: 127.0.0.4\n"
+        "  session:\n"
+        "    - subnet: 2001:db8:cafe::/48\n"
+        "      gateway: 2001:db8:cafe::1\n"
+        "      dnn: internet\n"
+        "      prefix_delegation: 56\n"
+        "    - subnet: 2001:db8:cafe:4000::/50\n"
+        "      dnn: internet\n"
+        "      prefix_delegation: 60\n"
+        "      static: true\n"
+        "    - subnet: 2001:db8:e1::/48\n"
+        "      dnn: internet\n"
+        "      prefix_delegation: 56\n"
+        "      static: true\n";
+    static const char *overlapping =
+        "smf:\n"
+        "  pfcp:\n"
+        "    server:\n"
+        "      - address: 127.0.0.4\n"
+        "  session:\n"
+        "    - subnet: 2001:db8:cafe::/48\n"
+        "      gateway: 2001:db8:cafe::1\n"
+        "      dnn: internet\n"
+        "    - subnet: 2001:db8:cafe:4000::/50\n"
+        "      dnn: internet\n";
+
+    ogs_app()->file = "pfcp-ue-ip-test.yaml";
+    document = load_yaml(tc, yaml);
+    rv = ogs_pfcp_context_parse_config("smf", "upf");
+    ABTS_INT_EQUAL(tc, OGS_OK, rv);
+
+    ogs_list_for_each(&ogs_pfcp_self()->subnet_list, subnet) {
+        if (subnet->prefixlen == 48 && !subnet->static_only) dyn = subnet;
+        else if (subnet->prefixlen == 50) nested = subnet;
+        else if (subnet->prefixlen == 48) own = subnet;
+    }
+    ABTS_PTR_NOTNULL(tc, dyn);
+    ABTS_PTR_NOTNULL(tc, nested);
+    ABTS_PTR_NOTNULL(tc, own);
+    if (!dyn || !nested || !own) {
+        unload_yaml(document);
+        return;
+    }
+    ABTS_TRUE(tc, dyn->static_only == false);
+    ABTS_TRUE(tc, nested->static_only == true);
+    ABTS_TRUE(tc, own->static_only == true);
+    ABTS_INT_EQUAL(tc, 60, nested->pd_prefixlen);
+    ABTS_INT_EQUAL(tc, 56, own->pd_prefixlen);
+
+    rv = ogs_pfcp_ue_pool_generate();
+    ABTS_INT_EQUAL(tc, OGS_OK, rv);
+    ABTS_INT_EQUAL(tc, TEST_POOL_SESS, dyn->pool.size);
+    ABTS_INT_EQUAL(tc, 0, nested->pool.size);
+    ABTS_INT_EQUAL(tc, 0, nested->pool.avail);
+    ABTS_INT_EQUAL(tc, 0, own->pool.size);
+    ABTS_INT_EQUAL(tc, 0, own->pool.avail);
+
+    /* Nested static-only subnet wins for the addresses it contains ... */
+    ue_ip = alloc_static6(tc, "internet", "2001:db8:cafe:4200::1", nested, 60);
+    if (ue_ip) ogs_pfcp_ue_ip_free(ue_ip);
+    /* ... the dynamic subnet keeps the rest (statics outside `range:`) */
+    ue_ip = alloc_static6(tc, "internet", "2001:db8:cafe:9900::1", dyn, 56);
+    if (ue_ip) ogs_pfcp_ue_ip_free(ue_ip);
+    /* Static-only subnet in its own address space */
+    ue_ip = alloc_static6(tc, "internet", "2001:db8:e1:100::1", own, 56);
+    if (ue_ip) ogs_pfcp_ue_ip_free(ue_ip);
+    reject_static6(tc, "internet", "2001:db8:e2::1");
+
+    /* Dynamic allocation never returns an entry of a static-only subnet */
+    ABTS_PTR_EQUAL(tc, dyn, ogs_pfcp_find_subnet_by_dnn(AF_INET6, "internet"));
+    for (i = 0; i < TEST_POOL_SESS; i++)
+        dynamic[i] = alloc_dynamic(tc, AF_INET6, "internet", dyn);
+    ABTS_INT_EQUAL(tc, 0, dyn->pool.avail);
+    ABTS_PTR_EQUAL(tc, NULL,
+            ogs_pfcp_find_subnet_by_dnn(AF_INET6, "internet"));
+    reject_dynamic(tc, AF_INET6, "internet");
+
+    /* Exhausted pools still accept their static addresses */
+    ue_ip = alloc_static6(tc, "internet", "2001:db8:cafe:9900::1", dyn, 56);
+    if (ue_ip) ogs_pfcp_ue_ip_free(ue_ip);
+    ue_ip = alloc_static6(tc, "internet", "2001:db8:cafe:4200::1", nested, 60);
+    if (ue_ip) ogs_pfcp_ue_ip_free(ue_ip);
+
+    for (i = 0; i < TEST_POOL_SESS; i++)
+        if (dynamic[i]) ogs_pfcp_ue_ip_free(dynamic[i]);
+    ABTS_INT_EQUAL(tc, TEST_POOL_SESS, dyn->pool.avail);
+
+    unload_yaml(document);
+
+    /* Nesting is only allowed for static-only subnets: two dynamic
+     * subnets of the same DNN must still not overlap */
+    document = load_yaml(tc, overlapping);
+    rv = ogs_pfcp_context_parse_config("smf", "upf");
+    ABTS_INT_EQUAL(tc, OGS_ERROR, rv);
+    unload_yaml(document);
+    ogs_app()->file = NULL;
+
+    /* The same through the API: static_only set before pool generation.
+     * A DNN with only a static-only subnet has no dynamic addresses. */
+    own = add_subnet6(tc, "2001:db8:e1::", "48", NULL, "internet", "56");
+    own->static_only = true;
+    rv = ogs_pfcp_ue_pool_generate();
+    ABTS_INT_EQUAL(tc, OGS_OK, rv);
+    ABTS_INT_EQUAL(tc, 0, own->pool.size);
+    ABTS_PTR_EQUAL(tc, NULL,
+            ogs_pfcp_find_subnet_by_dnn(AF_INET6, "internet"));
+    reject_dynamic(tc, AF_INET6, "internet");
+    ue_ip = alloc_static6(tc, "internet", "2001:db8:e1:100::1", own, 56);
+    if (ue_ip) ogs_pfcp_ue_ip_free(ue_ip);
+
+    ogs_pfcp_subnet_remove_all();
+}
+
+/* Defect 4: a DNN spans several pools, drained in configuration order */
+static void test_alloc_multi_pool(abts_case *tc, void *data)
+{
+    int rv, i;
+    ogs_pfcp_subnet_t *p1 = NULL, *p2 = NULL, *v4a = NULL, *v4b = NULL;
+    ogs_pfcp_ue_ip_t *ue_ip[TEST_POOL_SESS];
+
+    /* /61 with /63 blocks: block 0 (network + gateway) and the last
+     * block are excluded, leaving exactly 2 entries */
+    p1 = add_subnet6(tc, "2001:db8:aaaa::", "61", "2001:db8:aaaa::1",
+            "internet", "63");
+    p2 = add_subnet6(tc, "2001:db8:bbbb::", "48", "2001:db8:bbbb::1",
+            "internet", "56");
+    /* /29: .0 (network), .1 (gateway) and .7 (broadcast) excluded */
+    v4a = ogs_pfcp_subnet_add("10.45.0.0", "29", "10.45.0.1",
+            "internet", "ogstun");
+    ABTS_PTR_NOTNULL(tc, v4a);
+    v4b = ogs_pfcp_subnet_add("10.46.0.0", "16", "10.46.0.1",
+            "internet", "ogstun");
+    ABTS_PTR_NOTNULL(tc, v4b);
+
+    rv = ogs_pfcp_ue_pool_generate();
+    ABTS_INT_EQUAL(tc, OGS_OK, rv);
+    ABTS_INT_EQUAL(tc, 2, p1->pool.size);
+    ABTS_TRUE(tc, prefix64_equal(tc, &p1->pool.array[0], "2001:db8:aaaa:2::"));
+    ABTS_TRUE(tc, prefix64_equal(tc, &p1->pool.array[1], "2001:db8:aaaa:4::"));
+    ABTS_INT_EQUAL(tc, TEST_POOL_SESS, p2->pool.size);
+    ABTS_INT_EQUAL(tc, 5, v4a->pool.size);
+    ABTS_INT_EQUAL(tc, TEST_POOL_SESS, v4b->pool.size);
+
+    /* IPv6: 2 from pool 1, the third from pool 2 */
+    for (i = 0; i < 3; i++) {
+        ue_ip[i] = alloc_dynamic(tc, AF_INET6, "internet", i < 2 ? p1 : p2);
+        if (ue_ip[i])
+            ABTS_INT_EQUAL(tc, i < 2 ? 63 : 56,
+                    ogs_pfcp_ue_ip_prefixlen(ue_ip[i]));
+    }
+    ABTS_INT_EQUAL(tc, 0, p1->pool.avail);
+    ABTS_INT_EQUAL(tc, TEST_POOL_SESS - 1, p2->pool.avail);
+    ABTS_PTR_EQUAL(tc, p2, ogs_pfcp_find_subnet_by_dnn(AF_INET6, "internet"));
+
+    /* Freeing returns each entry to its own pool */
+    for (i = 0; i < 3; i++)
+        if (ue_ip[i]) ogs_pfcp_ue_ip_free(ue_ip[i]);
+    ABTS_INT_EQUAL(tc, 2, p1->pool.avail);
+    ABTS_INT_EQUAL(tc, TEST_POOL_SESS, p2->pool.avail);
+
+    /* Pool 1 is preferred again */
+    ABTS_PTR_EQUAL(tc, p1, ogs_pfcp_find_subnet_by_dnn(AF_INET6, "internet"));
+    ue_ip[0] = alloc_dynamic(tc, AF_INET6, "internet", p1);
+    if (ue_ip[0]) ogs_pfcp_ue_ip_free(ue_ip[0]);
+
+    /* Everything exhausted: rejected */
+    for (i = 0; i < 2 + TEST_POOL_SESS; i++)
+        alloc_dynamic(tc, AF_INET6, "internet", i < 2 ? p1 : p2);
+    reject_dynamic(tc, AF_INET6, "internet");
+    ABTS_INT_EQUAL(tc, 0, p1->pool.avail);
+    ABTS_INT_EQUAL(tc, 0, p2->pool.avail);
+
+    /* IPv4: 5 from pool 1, the sixth from pool 2 */
+    for (i = 0; i < 6; i++)
+        ue_ip[i] = alloc_dynamic(tc, AF_INET, "internet", i < 5 ? v4a : v4b);
+    ABTS_INT_EQUAL(tc, 0, v4a->pool.avail);
+    ABTS_INT_EQUAL(tc, TEST_POOL_SESS - 1, v4b->pool.avail);
+    for (i = 0; i < 6; i++)
+        if (ue_ip[i]) ogs_pfcp_ue_ip_free(ue_ip[i]);
+    ABTS_INT_EQUAL(tc, 5, v4a->pool.avail);
+    ABTS_INT_EQUAL(tc, TEST_POOL_SESS, v4b->pool.avail);
+    ue_ip[0] = alloc_dynamic(tc, AF_INET, "internet", v4a);
+    if (ue_ip[0]) ogs_pfcp_ue_ip_free(ue_ip[0]);
+
+    ogs_pfcp_subnet_remove_all();
+}
+
+/* DNN-less subnets serve any DNN; an exact DNN match is preferred */
+static void test_alloc_dnn_fallback(abts_case *tc, void *data)
+{
+    int rv;
+    ogs_pfcp_subnet_t *any = NULL, *ims = NULL;
+    ogs_pfcp_ue_ip_t *ue_ip = NULL;
+
+    any = add_subnet6(tc, "2001:db8:cafe::", "48", "2001:db8:cafe::1",
+            NULL, NULL);
+    ims = add_subnet6(tc, "2001:db8:babe::", "48", "2001:db8:babe::1",
+            "ims", "56");
+
+    rv = ogs_pfcp_ue_pool_generate();
+    ABTS_INT_EQUAL(tc, OGS_OK, rv);
+
+    /* No subnet for "internet": the DNN-less one is used */
+    ABTS_PTR_EQUAL(tc, any, ogs_pfcp_find_subnet_by_dnn(AF_INET6, "internet"));
+    ue_ip = alloc_dynamic(tc, AF_INET6, "internet", any);
+    if (ue_ip) {
+        ABTS_INT_EQUAL(tc, 64, ogs_pfcp_ue_ip_prefixlen(ue_ip));
+        ogs_pfcp_ue_ip_free(ue_ip);
+    }
+
+    /* "ims" has its own subnet, listed after the DNN-less one */
+    ABTS_PTR_EQUAL(tc, ims, ogs_pfcp_find_subnet_by_dnn(AF_INET6, "ims"));
+    ue_ip = alloc_dynamic(tc, AF_INET6, "ims", ims);
+    if (ue_ip) {
+        ABTS_INT_EQUAL(tc, 56, ogs_pfcp_ue_ip_prefixlen(ue_ip));
+        ogs_pfcp_ue_ip_free(ue_ip);
+    }
+
+    /* Without a DNN only DNN-less subnets count */
+    ABTS_PTR_EQUAL(tc, any, ogs_pfcp_find_subnet(AF_INET6));
+    ue_ip = alloc_dynamic(tc, AF_INET6, NULL, any);
+    if (ue_ip) ogs_pfcp_ue_ip_free(ue_ip);
+
+    /* Statics follow the same rule */
+    ue_ip = alloc_static6(tc, "internet", "2001:db8:cafe:100::1", any, 64);
+    if (ue_ip) ogs_pfcp_ue_ip_free(ue_ip);
+    ue_ip = alloc_static6(tc, "ims", "2001:db8:cafe:100::1", any, 64);
+    if (ue_ip) ogs_pfcp_ue_ip_free(ue_ip);
+    ue_ip = alloc_static6(tc, "ims", "2001:db8:babe:100::1", ims, 56);
+    if (ue_ip) ogs_pfcp_ue_ip_free(ue_ip);
+    ue_ip = alloc_static6(tc, NULL, "2001:db8:cafe:100::1", any, 64);
+    if (ue_ip) ogs_pfcp_ue_ip_free(ue_ip);
+    /* The "ims" subnet does not serve "internet" */
+    reject_static6(tc, "internet", "2001:db8:babe:100::1");
+    reject_static6(tc, NULL, "2001:db8:babe:100::1");
+
+    /* No IPv4 subnet at all */
+    reject_dynamic(tc, AF_INET, "internet");
+    reject_static4(tc, "internet", "10.45.0.2");
+
+    ogs_pfcp_subnet_remove_all();
+}
+
 abts_suite *test_pfcp_ue_ip(abts_suite *suite)
 {
     int id;
@@ -705,6 +1168,10 @@ abts_suite *test_pfcp_ue_ip(abts_suite *suite)
     abts_run_test(suite, test_pool_ipv4_unchanged, NULL);
     abts_run_test(suite, test_set_prefix_delegation, NULL);
     abts_run_test(suite, test_yaml_prefix_delegation, NULL);
+    abts_run_test(suite, test_alloc_static_containing_subnet, NULL);
+    abts_run_test(suite, test_alloc_static_only, NULL);
+    abts_run_test(suite, test_alloc_multi_pool, NULL);
+    abts_run_test(suite, test_alloc_dnn_fallback, NULL);
 
     ogs_log_set_domain_level(id, level);
     ogs_pfcp_context_final();

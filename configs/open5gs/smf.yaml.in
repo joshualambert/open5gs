@@ -425,6 +425,34 @@ smf:
 #    - subnet: 2001:db8:babe::/48
 #      dnn: ims
 #
+#  o Subnet selection
+#   Dynamic addresses come from the first subnet of the DNN that still has a
+#   free entry: subnets with a matching 'dnn' are tried first, then subnets
+#   without 'dnn' (which serve every DNN), each in the order listed here. A
+#   DNN may therefore list several non-contiguous pools; they are used one
+#   after the other.
+#   A static UE address (subscriber's ue.ipv4 / ue.ipv6) is attached to the
+#   subnet whose network contains it: 'static: true' subnets are tried
+#   before the dynamic ones (matching 'dnn' first, then without 'dnn'), so a
+#   static-only subnet nested inside a dynamic pool wins for the addresses
+#   it contains while statics kept inside a dynamic subnet (outside its
+#   'range') keep working. If no subnet of the DNN contains the address the
+#   session is rejected.
+#
+#  o Static-only subnet
+#   'static: true' declares a subnet that is never used for dynamic
+#   allocation (no pool is generated); it only supplies the prefix length,
+#   'dev' and its own 'prefix_delegation' for static subscriber addresses
+#   inside it. 'gateway' is optional. The same subnet may be listed under
+#   several DNNs.
+#  session:
+#    - subnet: 2001:db8:cafe::/48
+#      gateway: 2001:db8:cafe::1
+#      prefix_delegation: 56
+#    - subnet: 2001:db8:e1::/48
+#      prefix_delegation: 56
+#      static: true
+#
 #  o Pool Range
 #  session:
 #    - subnet: 10.45.0.0/16

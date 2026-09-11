@@ -560,8 +560,26 @@ int ogs_pfcp_subnet_set_prefix_delegation(
         ogs_pfcp_subnet_t *subnet, const char *value);
 void ogs_pfcp_subnet_remove(ogs_pfcp_subnet_t *subnet);
 void ogs_pfcp_subnet_remove_all(void);
+/*
+ * Subnet selection for dynamic allocation (DESIGN.md 5.4, 5.5): the first
+ * subnet of the family that is not `static: true` and still has a free
+ * pool entry. Subnets whose `dnn:` equals the DNN are visited first, then
+ * the DNN-less subnets, each group in configuration order.
+ * ogs_pfcp_find_subnet() only considers DNN-less subnets.
+ */
 ogs_pfcp_subnet_t *ogs_pfcp_find_subnet(int family);
 ogs_pfcp_subnet_t *ogs_pfcp_find_subnet_by_dnn(int family, const char *dnn);
+/*
+ * Subnet selection for a static address (DESIGN.md 5.3): the first subnet
+ * of the family whose network contains addr (4 or 16 bytes, network byte
+ * order), in this order: `static: true` subnets with matching dnn, then
+ * `static: true` DNN-less subnets, then dynamic subnets with matching dnn,
+ * then dynamic DNN-less subnets (each group in configuration order; dnn may
+ * be NULL). Exhausted pools are eligible. NULL when no subnet contains the
+ * address.
+ */
+ogs_pfcp_subnet_t *ogs_pfcp_find_subnet_by_addr(
+        int family, const char *dnn, const uint8_t *addr);
 
 void ogs_pfcp_pool_init(ogs_pfcp_sess_t *sess);
 void ogs_pfcp_pool_final(ogs_pfcp_sess_t *sess);
