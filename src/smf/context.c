@@ -37,6 +37,11 @@ static OGS_POOL(smf_n4_seid_pool, ogs_pool_id_t);
 
 static int context_initialized = 0;
 
+/* Locally administered, unicast: 02:00:00:00:01:01 */
+static const uint8_t smf_ra_default_link_layer_address[6] = {
+    0x02, 0x00, 0x00, 0x00, 0x01, 0x01
+};
+
 static int num_of_smf_sess = 0;
 
 static void stats_add_smf_session(void);
@@ -113,6 +118,20 @@ void smf_context_init(void)
     self.dhcpv6.preferred_lifetime = SMF_DHCPV6_DEFAULT_PREFERRED_LIFETIME;
     self.dhcpv6.valid_lifetime = SMF_DHCPV6_DEFAULT_VALID_LIFETIME;
     self.dhcpv6.rapid_commit = true;
+    self.dhcpv6.sticky = true;
+    self.dhcpv6.information_refresh_time =
+        SMF_DHCPV6_DEFAULT_INFORMATION_REFRESH_TIME;
+
+    /* Router Advertisement defaults (DESIGN.md section 5.9) */
+    self.router_advertisement.other_config = SMF_RA_OTHER_CONFIG_AUTO;
+    self.router_advertisement.on_link = false;
+    self.router_advertisement.rdnss = true;
+    self.router_advertisement.source_link_layer_address = true;
+    memcpy(self.router_advertisement.link_layer_address,
+            smf_ra_default_link_layer_address,
+            sizeof(self.router_advertisement.link_layer_address));
+    self.router_advertisement.router_lifetime =
+        SMF_RA_DEFAULT_ROUTER_LIFETIME;
 
     context_initialized = 1;
 }
@@ -421,12 +440,110 @@ static int smf_dhcpv6_config_finalize(bool t1_set, bool t2_set)
     }
 
     ogs_info("DHCPv6 server DUID[%s] lifetimes[%u/%u] T1/T2[%u/%u] "
-            "rapid_commit[%d] preference[%u]",
+            "rapid_commit[%d] preference[%u] binding_policy[%s] "
+            "information_refresh_time[%u]",
             (char *)ogs_hex_to_ascii(self.dhcpv6.duid.data,
                 self.dhcpv6.duid.len, hex, sizeof(hex)),
             self.dhcpv6.preferred_lifetime, self.dhcpv6.valid_lifetime,
             self.dhcpv6.t1, self.dhcpv6.t2,
-            self.dhcpv6.rapid_commit, self.dhcpv6.preference);
+            self.dhcpv6.rapid_commit, self.dhcpv6.preference,
+            self.dhcpv6.sticky ? "sticky" : "replace",
+            self.dhcpv6.information_refresh_time);
+
+    ogs_info("Router Advertisement other_config[%s] on_link[%d] rdnss[%d] "
+            "source_link_layer_address[%d] "
+            "link_layer_address[%02x:%02x:%02x:%02x:%02x:%02x] "
+            "router_lifetime[%u]",
+            self.router_advertisement.other_config ==
+                SMF_RA_OTHER_CONFIG_AUTO ? "auto" :
+            self.router_advertisement.other_config ==
+                SMF_RA_OTHER_CONFIG_TRUE ? "true" : "false",
+            self.router_advertisement.on_link,
+            self.router_advertisement.rdnss,
+            self.router_advertisement.source_link_layer_address,
+            self.router_advertisement.link_layer_address[0],
+            self.router_advertisement.link_layer_address[1],
+            self.router_advertisement.link_layer_address[2],
+            self.router_advertisement.link_layer_address[3],
+            self.router_advertisement.link_layer_address[4],
+            self.router_advertisement.link_layer_address[5],
+            self.router_advertisement.router_lifetime);
+
+    return OGS_OK;
+}
+
+/*
+ * router_advertisement.link_layer_address: six hexadecimal octets separated
+ * by ':' or '-'. The address is a made-up MAC for the virtual gateway; the
+ * locally administered bit (RFC 7042) should be set and the group bit must
+ * not be (a multicast address can never be a link-layer source).
+ */
+static int smf_ra_parse_link_layer_address(const char *v, uint8_t *mac)
+{
+    unsigned n = 0;
+    const char *p = NULL;
+
+    ogs_assert(v);
+    ogs_assert(mac);
+
+    for (p = v; *p; ) {
+        char *end = NULL;
+        unsigned long octet;
+
+        if (n >= 6 || !isxdigit((unsigned char)p[0]) ||
+            !isxdigit((unsigned char)p[1]))
+            goto invalid;
+        octet = strtoul(p, &end, 16);
+        if (end != p + 2 || octet > 0xff)
+            goto invalid;
+        mac[n++] = (uint8_t)octet;
+        p = end;
+        if (*p == ':' || *p == '-') {
+            if (!p[1])
+                goto invalid;
+            p++;
+        } else if (*p) {
+            goto invalid;
+        }
+    }
+    if (n != 6)
+        goto invalid;
+
+    if (mac[0] & 0x01) {
+        ogs_error("router_advertisement.link_layer_address [%s] is a "
+                "group (multicast) address", v);
+        return OGS_ERROR;
+    }
+    if (!(mac[0] & 0x02))
+        ogs_warn("router_advertisement.link_layer_address [%s] does not "
+                "have the locally administered bit set", v);
+
+    return OGS_OK;
+
+invalid:
+    ogs_error("router_advertisement.link_layer_address [%s] must be six "
+            "hexadecimal octets separated by ':' or '-'", v);
+    return OGS_ERROR;
+}
+
+/* router_advertisement.other_config: auto | true | false */
+static int smf_ra_parse_other_config(const char *v, int *out)
+{
+    ogs_assert(out);
+
+    if (!v || !strcasecmp(v, "auto"))
+        *out = SMF_RA_OTHER_CONFIG_AUTO;
+    else if (!strcasecmp(v, "true") || !strcasecmp(v, "yes") ||
+             !strcmp(v, "1"))
+        *out = SMF_RA_OTHER_CONFIG_TRUE;
+    else if (!strcasecmp(v, "false") || !strcasecmp(v, "no") ||
+             !strcmp(v, "0"))
+        *out = SMF_RA_OTHER_CONFIG_FALSE;
+    else {
+        ogs_error("router_advertisement.other_config [%s] must be "
+                "auto, true or false", v);
+        return OGS_ERROR;
+    }
 
     return OGS_OK;
 }
@@ -752,8 +869,72 @@ int smf_context_parse_config(void)
                                 return OGS_ERROR;
                             }
                             self.dhcpv6.preference = n;
+                        } else if (!strcmp(dhcpv6_key, "binding_policy")) {
+                            if (v && !strcasecmp(v, "sticky"))
+                                self.dhcpv6.sticky = true;
+                            else if (v && !strcasecmp(v, "replace"))
+                                self.dhcpv6.sticky = false;
+                            else {
+                                ogs_error("Invalid dhcpv6.%s [%s] "
+                                        "(sticky|replace)",
+                                        dhcpv6_key, v ? v : "");
+                                return OGS_ERROR;
+                            }
+                        } else if (!strcmp(dhcpv6_key,
+                                    "information_refresh_time")) {
+                            /* RFC 8415 section 21.23: IRT_MINIMUM 600 s */
+                            if (!smf_yaml_iter_uint32(&dhcpv6_iter, &n) ||
+                                n < SMF_DHCPV6_MIN_INFORMATION_REFRESH_TIME) {
+                                ogs_error("Invalid dhcpv6.%s (>= %u)",
+                                    dhcpv6_key,
+                                    SMF_DHCPV6_MIN_INFORMATION_REFRESH_TIME);
+                                return OGS_ERROR;
+                            }
+                            self.dhcpv6.information_refresh_time = n;
                         } else
                             ogs_warn("unknown key `%s`", dhcpv6_key);
+                    }
+                } else if (!strcmp(smf_key, "router_advertisement")) {
+                    ogs_yaml_iter_t ra_iter;
+                    ogs_yaml_iter_recurse(&smf_iter, &ra_iter);
+                    while (ogs_yaml_iter_next(&ra_iter)) {
+                        const char *ra_key = ogs_yaml_iter_key(&ra_iter);
+                        const char *v = ogs_yaml_iter_value(&ra_iter);
+                        uint32_t n = 0;
+                        ogs_assert(ra_key);
+                        if (!strcmp(ra_key, "other_config")) {
+                            if (smf_ra_parse_other_config(v,
+                                    &self.router_advertisement.other_config)
+                                    != OGS_OK)
+                                return OGS_ERROR;
+                        } else if (!strcmp(ra_key, "on_link")) {
+                            self.router_advertisement.on_link =
+                                ogs_yaml_iter_bool(&ra_iter);
+                        } else if (!strcmp(ra_key, "rdnss")) {
+                            self.router_advertisement.rdnss =
+                                ogs_yaml_iter_bool(&ra_iter);
+                        } else if (!strcmp(ra_key,
+                                    "source_link_layer_address")) {
+                            self.router_advertisement.
+                                source_link_layer_address =
+                                    ogs_yaml_iter_bool(&ra_iter);
+                        } else if (!strcmp(ra_key, "link_layer_address")) {
+                            if (!v || smf_ra_parse_link_layer_address(v,
+                                    self.router_advertisement.
+                                        link_layer_address) != OGS_OK)
+                                return OGS_ERROR;
+                        } else if (!strcmp(ra_key, "router_lifetime")) {
+                            /* RFC 4861 section 4.2: 16 bits, 0 = not a
+                             * default router */
+                            if (!smf_yaml_iter_uint32(&ra_iter, &n) ||
+                                n > UINT16_MAX) {
+                                ogs_error("Invalid router_advertisement.%s "
+                                        "(0..65535)", ra_key);
+                                return OGS_ERROR;
+                            }
+                            self.router_advertisement.router_lifetime = n;
+                        } else
+                            ogs_warn("unknown key `%s`", ra_key);
                     }
                 } else if (!strcmp(smf_key, "p-cscf")) {
                     ogs_yaml_iter_t p_cscf_iter;
@@ -2335,10 +2516,53 @@ int smf_sess_pdr_set_ue_ip_addr(smf_sess_t *sess, ogs_pfcp_pdr_t *pdr)
     return OGS_OK;
 }
 
+/*
+ * Neighbour Discovery filters for the SMF link-local address L (fixed for
+ * the lifetime of the process, known once smf_gtp_open() has run):
+ *   permit out 58 from <solicited-node(L)>/128 to assigned
+ *   permit out 58 from <L>/128 to assigned
+ * Built on first use. In TS 29.212 flow descriptions "from" is the remote
+ * side of the "out" (uplink) direction, i.e. the packet destination.
+ */
+static const char *smf_nd_flow_description(int index)
+{
+    static char description[2][96];
+    static bool built = false;
+    uint8_t link_local[OGS_IPV6_LEN], solicited[OGS_IPV6_LEN];
+    char buf[OGS_ADDRSTRLEN];
+
+    ogs_assert(index >= 0 && index < (int)OGS_ARRAY_SIZE(description));
+
+    if (!built) {
+        smf_gtp_link_local_addr(link_local);
+
+        /* RFC 4291 section 2.7.1: ff02::1:ffXX:XXXX, low 24 bits of L */
+        memset(solicited, 0, sizeof(solicited));
+        solicited[0] = 0xff;
+        solicited[1] = 0x02;
+        solicited[11] = 0x01;
+        solicited[12] = 0xff;
+        memcpy(solicited + 13, link_local + 13, 3);
+
+        ogs_snprintf(description[0], sizeof(description[0]),
+                "permit out 58 from %s/128 to assigned",
+                OGS_INET6_NTOP(solicited, buf));
+        ogs_snprintf(description[1], sizeof(description[1]),
+                "permit out 58 from %s/128 to assigned",
+                OGS_INET6_NTOP(link_local, buf));
+        built = true;
+
+        ogs_info("UP2CP Neighbour Discovery filters [%s] [%s]",
+                description[0], description[1]);
+    }
+
+    return description[index];
+}
+
 void smf_sess_set_up2cp_flow_description(smf_sess_t *sess)
 {
     ogs_pfcp_pdr_t *up2cp_pdr = NULL;
-    static const char *description[] = {
+    const char *description[] = {
         /* ICMPv6 Router Solicitation */
         "permit out 58 from ff02::2/128 to assigned",
         /*
@@ -2351,6 +2575,13 @@ void smf_sess_set_up2cp_flow_description(smf_sess_t *sess)
          * is the only DHCPv6 server the UE can reach) covers both cases.
          */
         "permit out 17 from any 547 to assigned",
+        /*
+         * ICMPv6 Neighbour Solicitation for the gateway (RFC 4861): to the
+         * solicited-node multicast address of the SMF link-local (address
+         * resolution) and to the link-local itself (NUD probes).
+         */
+        smf_nd_flow_description(0),
+        smf_nd_flow_description(1),
     };
     size_t i;
 

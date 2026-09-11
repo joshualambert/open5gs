@@ -60,7 +60,8 @@ extern "C" {
 #define OGS_DHCPV6_RECONFIGURE              10
 #define OGS_DHCPV6_INFORMATION_REQUEST      11
 
-/* Option codes (RFC 8415 section 21, RFC 3646, RFC 6603) */
+/* Option codes (RFC 8415 section 21, RFC 3646, RFC 6603, RFC 8415
+ * section 21.23 Information Refresh Time) */
 #define OGS_DHCPV6_OPTION_CLIENTID          1
 #define OGS_DHCPV6_OPTION_SERVERID          2
 #define OGS_DHCPV6_OPTION_IA_NA             3
@@ -71,11 +72,13 @@ extern "C" {
 #define OGS_DHCPV6_OPTION_ELAPSED_TIME      8
 #define OGS_DHCPV6_OPTION_STATUS_CODE       13
 #define OGS_DHCPV6_OPTION_RAPID_COMMIT      14
+#define OGS_DHCPV6_OPTION_VENDOR_CLASS      16
 #define OGS_DHCPV6_OPTION_RECONF_ACCEPT     20
 #define OGS_DHCPV6_OPTION_DNS_SERVERS       23
 #define OGS_DHCPV6_OPTION_DOMAIN_LIST       24
 #define OGS_DHCPV6_OPTION_IA_PD             25
 #define OGS_DHCPV6_OPTION_IAPREFIX          26
+#define OGS_DHCPV6_OPTION_INFORMATION_REFRESH_TIME 32
 #define OGS_DHCPV6_OPTION_PD_EXCLUDE        67
 #define OGS_DHCPV6_OPTION_SOL_MAX_RT        82
 #define OGS_DHCPV6_OPTION_INF_MAX_RT        83
@@ -193,6 +196,9 @@ typedef struct ogs_dhcpv6_message_s {
 
     uint32_t sol_max_rt;                /* 0 = absent */
     uint32_t inf_max_rt;                /* 0 = absent */
+
+    /* RFC 8415 section 21.23, Reply to an Information-request only */
+    uint32_t information_refresh_time;  /* seconds, 0 = absent */
 } ogs_dhcpv6_message_t;
 
 /*
@@ -211,7 +217,8 @@ int ogs_dhcpv6_parse(
  * Serialise `msg` into `buf`. Only what is set is emitted (DUIDs with
  * len > 0, each IA_PD with its IA Prefixes, their PD_EXCLUDE and status,
  * IA_NA with status only, ORO, flags, elapsed time, preference, status,
- * DNS servers, SOL_MAX_RT / INF_MAX_RT when non-zero). Returns the number of
+ * DNS servers, SOL_MAX_RT / INF_MAX_RT / INFORMATION_REFRESH_TIME when
+ * non-zero). Returns the number of
  * bytes written, or -1 when `buf` is too small or `msg` is inconsistent.
  * The buffer is never written past `buflen`.
  */

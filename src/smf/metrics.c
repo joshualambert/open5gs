@@ -145,6 +145,17 @@ smf_metrics_spec_def_t smf_metrics_spec_def_global[_SMF_METR_GLOB_MAX] = {
     .name = "dhcpv6_tx_reply",
     .description = "Sent DHCPv6 Reply messages",
 },
+[SMF_METR_GLOB_CTR_ND_RX_NS] = {
+    .type = OGS_METRICS_METRIC_TYPE_COUNTER,
+    .name = "nd_rx_neighbor_solicitation",
+    .description = "Received ICMPv6 Neighbor Solicitations for the SMF "
+        "link-local address",
+},
+[SMF_METR_GLOB_CTR_ND_TX_NA] = {
+    .type = OGS_METRICS_METRIC_TYPE_COUNTER,
+    .name = "nd_tx_neighbor_advertisement",
+    .description = "Sent ICMPv6 Neighbor Advertisements",
+},
 /* Global Gauges: */
 [SMF_METR_GLOB_GAUGE_UES_ACTIVE] = {
     .type = OGS_METRICS_METRIC_TYPE_GAUGE,

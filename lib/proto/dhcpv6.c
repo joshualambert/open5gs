@@ -383,6 +383,7 @@ typedef struct parse_ctx_s {
     bool dns;
     bool sol_max_rt;
     bool inf_max_rt;
+    bool information_refresh_time;
 } parse_ctx_t;
 
 static int check_singleton(bool *seen, uint16_t code)
@@ -545,6 +546,14 @@ static int message_option(void *ctx,
         if (check_fixed_len(code, len, 4) != OGS_OK)
             return OGS_ERROR;
         msg->inf_max_rt = get32(p);
+        return OGS_OK;
+
+    case OGS_DHCPV6_OPTION_INFORMATION_REFRESH_TIME:
+        if (check_singleton(&pc->information_refresh_time, code) != OGS_OK)
+            return OGS_ERROR;
+        if (check_fixed_len(code, len, 4) != OGS_OK)
+            return OGS_ERROR;
+        msg->information_refresh_time = get32(p);
         return OGS_OK;
 
     default:
@@ -806,6 +815,11 @@ static bool build_message(writer_t *w, const ogs_dhcpv6_message_t *msg)
     if (msg->inf_max_rt &&
             (!put16(w, OGS_DHCPV6_OPTION_INF_MAX_RT) || !put16(w, 4) ||
              !put32(w, msg->inf_max_rt)))
+        return false;
+
+    if (msg->information_refresh_time &&
+            (!put16(w, OGS_DHCPV6_OPTION_INFORMATION_REFRESH_TIME) ||
+             !put16(w, 4) || !put32(w, msg->information_refresh_time)))
         return false;
 
     return true;

@@ -380,14 +380,119 @@ static void reply_fill_ia_pd(ogs_dhcpv6_message_t *rsp,
 }
 
 /*
- * Binding policy
+ * Binding policy (DESIGN.md section 5.2)
+ *
+ * A binding is committed by Request / Solicit+Rapid-Commit and refreshed
+ * by Renew/Rebind; it expires valid_lifetime after the last (re)binding,
+ * evaluated lazily on the next message (binding_expire()). With
+ * `binding_policy: sticky` a binding is *live*, and therefore protected
+ * against a different DUID, while
+ *   active && now < bound_at + valid_lifetime && now < last_seen + T2
+ * (T2 falls back to valid_lifetime when configured as 0). A bound router
+ * renews at T1 and rebinds at T2, so silence past T2 means it is gone and a
+ * replacement router behind the same passthrough CPE may take the prefix
+ * over. With `replace` any Request takes the prefix over immediately.
  */
+static bool binding_same_client(const smf_dhcpv6_binding_t *binding,
+        const ogs_dhcpv6_message_t *req)
+{
+    ogs_assert(binding);
+    ogs_assert(req);
+
+    return binding->active &&
+        duid_equal(&binding->client_id, &req->client_id);
+}
+
+static bool binding_live(const smf_dhcpv6_binding_t *binding)
+{
+    ogs_time_t now;
+    uint32_t t2;
+
+    ogs_assert(binding);
+
+    if (!binding->active)
+        return false;
+
+    now = ogs_time_now();
+    if (now >= binding->bound_at +
+            ogs_time_from_sec(smf_self()->dhcpv6.valid_lifetime))
+        return false;
+
+    t2 = smf_self()->dhcpv6.t2 ?
+        smf_self()->dhcpv6.t2 : smf_self()->dhcpv6.valid_lifetime;
+    if (now >= binding->last_seen + ogs_time_from_sec(t2))
+        return false;
+
+    return true;
+}
+
+/* The bound client has spoken: postpone the T2 silence takeover */
+static void binding_touch(smf_sess_t *sess, const ogs_dhcpv6_message_t *req)
+{
+    ogs_assert(sess);
+    ogs_assert(req);
+
+    if (binding_same_client(&sess->dhcpv6, req))
+        sess->dhcpv6.last_seen = ogs_time_now();
+}
+
+/* Lazy expiry: the delegation is gone valid_lifetime after (re)binding */
+static void binding_expire(smf_sess_t *sess)
+{
+    smf_dhcpv6_binding_t *binding = NULL;
+    char duid[SMF_DHCPV6_LOG_DUID_LEN * 2 + 3];
+
+    ogs_assert(sess);
+    binding = &sess->dhcpv6;
+
+    if (!binding->active)
+        return;
+    if (ogs_time_now() < binding->bound_at +
+            ogs_time_from_sec(smf_self()->dhcpv6.valid_lifetime))
+        return;
+
+    ogs_info("[%s] DHCPv6-PD binding IAID[0x%x] of client DUID[%s] expired "
+            "(valid_lifetime %u s)", sess_id_str(sess), binding->iaid,
+            duid_str(&binding->client_id, duid),
+            smf_self()->dhcpv6.valid_lifetime);
+
+    memset(binding, 0, sizeof(*binding));
+}
+
+/*
+ * True when `req` (Solicit/Request) comes from a DUID other than the one
+ * holding a live sticky binding. Logged once per refused message.
+ */
+static bool binding_refuses(smf_sess_t *sess, const ogs_dhcpv6_message_t *req)
+{
+    smf_dhcpv6_binding_t *binding = NULL;
+    char bound[SMF_DHCPV6_LOG_DUID_LEN * 2 + 3];
+    char other[SMF_DHCPV6_LOG_DUID_LEN * 2 + 3];
+
+    ogs_assert(sess);
+    ogs_assert(req);
+    binding = &sess->dhcpv6;
+
+    if (!smf_self()->dhcpv6.sticky || !binding->active ||
+        binding_same_client(binding, req) || !binding_live(binding))
+        return false;
+
+    ogs_warn("[%s] DHCPv6 %s from client DUID[%s] refused: prefix is bound "
+            "to client DUID[%s] IAID[0x%x]", sess_id_str(sess),
+            ogs_dhcpv6_msg_type_name(req->msg_type),
+            duid_str(&req->client_id, other),
+            duid_str(&binding->client_id, bound), binding->iaid);
+
+    return true;
+}
+
 static void binding_commit(smf_sess_t *sess,
         const ogs_dhcpv6_message_t *req, const ogs_dhcpv6_iaprefix_t *prefix,
         bool pd_exclude, bool refresh)
 {
     smf_dhcpv6_binding_t *binding = NULL;
     char duid[SMF_DHCPV6_LOG_DUID_LEN * 2 + 3];
+    char bound[SMF_DHCPV6_LOG_DUID_LEN * 2 + 3];
     char buf[OGS_ADDRSTRLEN];
 
     ogs_assert(sess);
@@ -398,16 +503,19 @@ static void binding_commit(smf_sess_t *sess,
     binding = &sess->dhcpv6;
 
     if (binding->active && !duid_equal(&binding->client_id, &req->client_id))
-        ogs_info("[%s] DHCPv6-PD binding taken over by another client "
-                "DUID[%s] (%s)", sess_id_str(sess),
+        ogs_info("[%s] DHCPv6-PD binding of client DUID[%s] taken over by "
+                "client DUID[%s] (%s)%s", sess_id_str(sess),
+                duid_str(&binding->client_id, bound),
                 duid_str(&req->client_id, duid),
-                ogs_dhcpv6_msg_type_name(req->msg_type));
+                ogs_dhcpv6_msg_type_name(req->msg_type),
+                smf_self()->dhcpv6.sticky ? " after T2 silence" : "");
 
     binding->active = true;
     binding->client_id = req->client_id;
     binding->iaid = req->ia_pd[0].iaid;
     binding->pd_exclude = pd_exclude;
     binding->bound_at = ogs_time_now();
+    binding->last_seen = binding->bound_at;
 
     if (refresh)
         ogs_debug("[%s] DHCPv6-PD refreshed %s/%d IAID[0x%x] (%s)",
@@ -441,6 +549,26 @@ static void binding_release(smf_sess_t *sess)
  * when the message is to be discarded (RFC 8415 section 16).
  */
 
+/*
+ * Sticky refusal of a Solicit/Request from a foreign DUID: IA_PD with
+ * NoPrefixAvail, IA_NA with NoAddrsAvail (RFC 7550: a status inside every
+ * IA), DNS and the *_MAX_RT options as usual, so the client keeps a working
+ * stateless configuration and retries later.
+ */
+static void reply_refuse_foreign(
+        ogs_dhcpv6_message_t *rsp, const ogs_dhcpv6_message_t *req)
+{
+    ogs_assert(rsp);
+    ogs_assert(req);
+
+    reply_fill_ia_pd_status(rsp, req, OGS_DHCPV6_STATUS_NO_PREFIX_AVAIL,
+            "prefix is bound to another client");
+    reply_fill_ia_na(rsp, req, OGS_DHCPV6_STATUS_NO_ADDRS_AVAIL,
+            "addresses are assigned by SLAAC");
+    reply_add_dns(rsp);
+    reply_add_max_rt(rsp, req);
+}
+
 /* RFC 8415 section 18.4: a unicast message is answered with UseMulticast,
  * Server-ID, Client-ID and nothing else - in an Advertise when the
  * message was a Solicit, in a Reply for any other message type */
@@ -459,6 +587,12 @@ static bool handle_solicit(smf_sess_t *sess,
 {
     ogs_dhcpv6_iaprefix_t prefix;
     bool pd_exclude, have_prefix, commit;
+
+    if (req->num_of_ia_pd && binding_refuses(sess, req)) {
+        reply_init(rsp, req, OGS_DHCPV6_ADVERTISE);
+        reply_refuse_foreign(rsp, req);
+        return true;
+    }
 
     pd_exclude = ogs_dhcpv6_oro_contains(req, OGS_DHCPV6_OPTION_PD_EXCLUDE);
     have_prefix = smf_dhcpv6_delegated_prefix(sess, pd_exclude, &prefix);
@@ -494,6 +628,14 @@ static bool handle_request(smf_sess_t *sess,
     ogs_dhcpv6_iaprefix_t prefix;
     bool pd_exclude, have_prefix;
 
+    if (req->num_of_ia_pd && binding_refuses(sess, req)) {
+        reply_init(rsp, req, OGS_DHCPV6_REPLY);
+        reply_refuse_foreign(rsp, req);
+        return true;
+    }
+
+    binding_touch(sess, req);
+
     pd_exclude = ogs_dhcpv6_oro_contains(req, OGS_DHCPV6_OPTION_PD_EXCLUDE);
     have_prefix = smf_dhcpv6_delegated_prefix(sess, pd_exclude, &prefix);
 
@@ -511,10 +653,12 @@ static bool handle_request(smf_sess_t *sess,
 }
 
 /*
- * Renew: the binding must be active and belong to this client (any IAID).
+ * Renew: the binding must be active and belong to this client (any IAID),
+ * otherwise NoBinding (RFC 8415 section 18.3.4).
  * Rebind: like Renew, but a client that is not the bound one is only
- * refused while a binding is active; without one the session prefix is
- * (re)delegated, the UE being the only requesting router on its link.
+ * refused (NoBinding) while a binding is active, whatever the policy;
+ * without one the session prefix is (re)delegated, the UE being the only
+ * legitimate requesting router on its link (section 18.3.5).
  */
 static bool handle_renew_rebind(smf_sess_t *sess,
         ogs_dhcpv6_message_t *rsp, const ogs_dhcpv6_message_t *req)
@@ -522,15 +666,26 @@ static bool handle_renew_rebind(smf_sess_t *sess,
     smf_dhcpv6_binding_t *binding = NULL;
     ogs_dhcpv6_iaprefix_t prefix;
     bool pd_exclude, have_prefix, same_client;
+    char bound[SMF_DHCPV6_LOG_DUID_LEN * 2 + 3];
+    char other[SMF_DHCPV6_LOG_DUID_LEN * 2 + 3];
 
     binding = &sess->dhcpv6;
-    same_client = binding->active &&
-        duid_equal(&binding->client_id, &req->client_id);
+    same_client = binding_same_client(binding, req);
+    binding_touch(sess, req);
 
     reply_init(rsp, req, OGS_DHCPV6_REPLY);
 
     if (!same_client &&
         (req->msg_type == OGS_DHCPV6_RENEW || binding->active)) {
+        ogs_warn("[%s] DHCPv6 %s from client DUID[%s] refused: %s "
+                "DUID[%s] IAID[0x%x]", sess_id_str(sess),
+                ogs_dhcpv6_msg_type_name(req->msg_type),
+                duid_str(&req->client_id, other),
+                binding->active ? "prefix is bound to client" :
+                    "no binding, last client",
+                binding->client_id.len ?
+                    duid_str(&binding->client_id, bound) : "none",
+                binding->iaid);
         reply_fill_ia_pd_status(rsp, req, OGS_DHCPV6_STATUS_NO_BINDING,
                 "no binding for this client");
         reply_fill_ia_na(rsp, req, OGS_DHCPV6_STATUS_NO_BINDING,
@@ -564,6 +719,7 @@ static bool handle_release(smf_sess_t *sess,
     int i;
 
     binding = &sess->dhcpv6;
+    binding_touch(sess, req);
 
     reply_init(rsp, req, OGS_DHCPV6_REPLY);
     status_set(&rsp->status, OGS_DHCPV6_STATUS_SUCCESS, "release received");
@@ -592,12 +748,18 @@ static bool handle_release(smf_sess_t *sess,
     return true;
 }
 
+/* RFC 8415 section 18.3.6; Information Refresh Time (section 21.23) is
+ * only sent when requested in the ORO and only in this Reply */
 static bool handle_information_request(
         ogs_dhcpv6_message_t *rsp, const ogs_dhcpv6_message_t *req)
 {
     reply_init(rsp, req, OGS_DHCPV6_REPLY);
     reply_add_dns(rsp);
     reply_add_max_rt(rsp, req);
+    if (ogs_dhcpv6_oro_contains(req,
+                OGS_DHCPV6_OPTION_INFORMATION_REFRESH_TIME))
+        rsp->information_refresh_time =
+            smf_self()->dhcpv6.information_refresh_time;
 
     return true;
 }
@@ -655,6 +817,8 @@ static bool build_reply(smf_sess_t *sess, ogs_dhcpv6_message_t *rsp,
 
     if (!multicast && req->msg_type != OGS_DHCPV6_INFORMATION_REQUEST)
         return handle_unicast(rsp, req);
+
+    binding_expire(sess);
 
     switch (req->msg_type) {
     case OGS_DHCPV6_SOLICIT:
