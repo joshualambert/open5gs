@@ -306,3 +306,167 @@ truncation at every offset).
 * Uplink anti-spoofing in the UPF is preserved and extended to the block.
 * Server DUID is stable and non-secret; transaction IDs are chosen by the
   client and only echoed.
+
+## 5. Hardware findings (2026-09-11) and the second iteration
+
+First deployment on a live EPC (Global Telecom Titan 4000 in IP passthrough →
+TP-Link HX220 → laptop) exposed eight defects. This section is the design
+for fixing them; interfaces are fixed here so the pieces can be built in
+parallel. Threat model that drives most of it: **a passthrough CPE leaks LAN
+link-local traffic onto the bearer** (mDNS, ND, DHCPv6 from LAN hosts were
+all seen on the wire), so anything the core accepts from a link-local source
+inside the tunnel must be treated as potentially coming from an untrusted LAN
+host, not from the subscriber's router.
+
+### 5.1 Neighbour Discovery for the gateway (Defect 1)
+
+A router behind a passthrough CPE has an Ethernet WAN. Its default gateway
+is the RA source (`fe80::1` or the SMF link-local), and it must resolve that
+address to a MAC before it can forward anything; it sends NS to
+`ff02::1:ff00:1` (solicited-node) and, for NUD re-probes, unicast NS to
+`fe80::1`. Nothing answered. Fix:
+
+* **SMF** answers NS whose *target* is the SMF link-local with a unicast
+  Neighbour Advertisement to the solicitor (R=1, S=1, O=1, Target
+  Link-Layer Address option = the virtual MAC). Sources may be link-local or
+  global. NS from `::` (DAD) is never answered.
+* **RA** carries a Source Link-Layer Address option (type 1) with the same
+  virtual MAC, so routers usually do not need to ask.
+* **UP2CP SDF filters** (SMF `smf_sess_set_up2cp_flow_description()`,
+  computed from the actual SMF link-local `L`):
+  `permit out 58 from <solicited-node(L)>/128 to assigned` and
+  `permit out 58 from <L>/128 to assigned`, in addition to the RS and
+  DHCPv6 rules. `solicited-node(L) = ff02::1:ff00:0000 | (L & 0xffffff)`.
+* Knobs (`smf.router_advertisement`, see 5.6): `link_layer_address`
+  (default `02:00:00:00:01:01`, locally administered; proven on hardware to
+  be accepted regardless of value) and `source_link_layer_address: true`.
+
+### 5.2 Link-local sources and sticky bindings (Defect 2)
+
+* **UPF**: a link-local (`fe80::/10`) or unspecified (`::`) uplink source is
+  accepted **only when the packet matched a PDR whose FAR destination is the
+  CP function** (RS, NS-for-gateway, DHCPv6). On any other PDR it is dropped
+  in the UPF (`[DROP] Link-local source not for the control plane`) and
+  counted (`upf_metrics`: `ul_drop_link_local`). Nothing link-local ever
+  reaches `ogstun`.
+* **SMF binding policy** (`smf.dhcpv6.binding_policy: sticky | replace`,
+  default `sticky`): while a binding is live (committed and
+  `now < bound_at + valid_lifetime`), a Solicit/Request from a different
+  DUID gets IA_PD `NoPrefixAvail` ("prefix is bound to another client"),
+  Renew/Rebind from a different DUID get `NoBinding`; both are logged at
+  `ogs_warn` with both DUIDs. The bound client's Release or the lifetime
+  expiry frees the binding. `replace` restores the first-iteration
+  behaviour. Binding expiry is evaluated lazily on each message; there is
+  still no server-side timer.
+
+### 5.3 Static addresses must land in the containing subnet (Defect 3)
+
+`ogs_pfcp_ue_ip_alloc()` for a static address chooses, among the subnets
+matching family and DNN (an exact DNN match first, then DNN-less subnets),
+the one whose network **contains** the address:
+`ogs_pfcp_find_subnet_by_addr(int family, const char *dnn, const uint8_t *addr)`.
+If none contains it the allocation fails with
+`OGS_PFCP_CAUSE_NO_RESOURCES_AVAILABLE` and
+`ogs_error("Static UE IPv6 %s is not inside any subnet of DNN[%s]")`; the
+session is rejected rather than routed into the wrong pool.
+
+### 5.4 Several pools per DNN (Defect 4)
+
+Dynamic allocation walks the subnets of the DNN in configuration order and
+takes the first with `pool.avail > 0` (already the case); the UPF downlink
+lookup is global across subnets. This is now covered by an integration test
+with two `prefix_delegation` subnets on one DNN, the first sized to a single
+block: UE1 lands in pool 1, UE2 in pool 2, both forward, both free on
+detach.
+
+### 5.5 Static-only subnets and per-session kernel routes (Defect 5)
+
+A subnet entry may be declared
+
+```yaml
+    - subnet: 2602:f815:e1::/48
+      dev: ogstun2
+      prefix_delegation: 56
+      static: true          # NEW: no dynamic pool, statics only, per-session routes
+```
+
+`ogs_pfcp_subnet_t.static_only` (bool). Such a subnet generates no pool
+(`pool.size == 0`) and is only ever chosen by containment (5.3). The same
+subnet may be listed under several DNNs with different `dev`s: a
+subscriber's static block is then identical on every APN and the traffic
+follows the session to the right tun.
+
+Because the block is not covered by the address the operator put on the tun,
+the **UPF installs a kernel route** for it when the session is created and
+removes it when the session is deleted (Linux rtnetlink, `RTM_NEWROUTE` /
+`RTM_DELROUTE`, `rtm_protocol = 250` so the routes are recognisable, output
+interface = the subnet's `dev`). Rules:
+
+* route the session block (`ipv6->addr` masked to L) when
+  `sess->ipv6->subnet->static_only`; route each IPv6/IPv4 framed route
+  likewise;
+* at UPF start, dump the routing table and delete every route with protocol
+  250 (left over from a previous instance);
+* non-Linux builds log once that per-session routes are unsupported.
+
+Implemented in `src/upf/route.c` (`upf_route_init()`, `upf_route_final()`,
+`upf_route_add(const ogs_ipsubnet_t *prefix, uint8_t prefixlen, const char *ifname)`,
+`upf_route_del(...)`) and called from `upf_sess_set_ue_ip()` /
+`upf_sess_clear_ue_ip()` / framed-route setters.
+
+### 5.6 Router Advertisement knobs (Defect 6)
+
+```yaml
+smf:
+  router_advertisement:           # NEW, all optional
+    other_config: auto            # auto | true | false  (O flag; auto = 1 when PD block or IPv6 DNS)
+    on_link: false                # L flag on the Prefix Information option (TS 29.061: cleared)
+    rdnss: true                   # RFC 8106 RDNSS option from `dns`
+    source_link_layer_address: true
+    link_layer_address: 02:00:00:00:01:01
+    router_lifetime: 64800        # seconds
+```
+
+Defaults are the first-iteration behaviour plus SLLA. Stock Open5GS
+corresponds to `other_config: false, on_link: true, rdnss: false,
+source_link_layer_address: false`.
+
+### 5.7 RS from the unspecified address (Defect 7)
+
+RFC 4861 §4.1 allows an RS sourced from `::`. The UPF accepts `::` under the
+same CP-function-only rule as link-local (5.2). The SMF answers an RS from
+`::` with an RA sent to `ff02::1` (all-nodes), as §6.2.6 requires; an RS
+from a unicast source keeps getting a unicast RA. RS handling never looks at
+the interface identifier.
+
+### 5.8 Client fixtures (Defect 8)
+
+From the capture, encoded as unit-test vectors in `tests/unit/dhcpv6-test.c`
+and as an integration scenario:
+
+* HX220 Information-request: Client-ID DUID-LL `2e:2f:d0:b8:f1:9d`,
+  Elapsed-Time, Vendor-Class (enterprise 11863 "TP-Link Technology
+  Co.,Ltd"), ORO `[32, 23, 16]` — sent even when the RA had O=0.
+* HX220 Solicit: IA_PD IAID `0xd0b8f19d`, T1 = T2 = `0xffffffff`, no
+  IAPREFIX hint, no PD_EXCLUDE, no Rapid Commit; then Request → Reply.
+* New option: `OPTION_INFORMATION_REFRESH_TIME` (32) is encoded/decoded and
+  included in the Reply to an Information-request when requested
+  (`smf.dhcpv6.information_refresh_time`, default 86400 s).
+* IA_NA in any message is answered with a Status Code **inside** the IA_NA
+  (`NoAddrsAvail`), so RFC 7550 clients do not abandon the exchange.
+* The Request→Release loop seen on 2026-09-10 (`00:13:26–00:13:39`) is
+  analysed in TESTING.md; root cause was the wrong-subnet block of 5.3.
+
+### 5.9 New configuration keys, summary
+
+| Key | Default | Section |
+|---|---|---|
+| `smf.session[].static` / `upf.session[].static` | `false` | 5.5 |
+| `smf.dhcpv6.binding_policy` | `sticky` | 5.2 |
+| `smf.dhcpv6.information_refresh_time` | `86400` | 5.8 |
+| `smf.router_advertisement.other_config` | `auto` | 5.6 |
+| `smf.router_advertisement.on_link` | `false` | 5.6 |
+| `smf.router_advertisement.rdnss` | `true` | 5.6 |
+| `smf.router_advertisement.source_link_layer_address` | `true` | 5.1 |
+| `smf.router_advertisement.link_layer_address` | `02:00:00:00:01:01` | 5.1 |
+| `smf.router_advertisement.router_lifetime` | `64800` | 5.6 |
