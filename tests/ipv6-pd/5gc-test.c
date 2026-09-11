@@ -29,12 +29,36 @@ typedef struct fgc_gnb_s {
 
 static test_ue_t *ue_new(const char *msin, uint32_t id_base);
 
+/* Reads one NGAP message within PD_SIGNALLING_TIMEOUT and dispatches it */
+static bool recv_ngap(abts_case *tc, fgc_gnb_t *gnb, test_ue_t *test_ue)
+{
+    ogs_pkbuf_t *recvbuf = NULL;
+
+    recvbuf = testgnb_ngap_read_timeout(gnb->ngap, PD_SIGNALLING_TIMEOUT);
+    ABTS_PTR_NOTNULL(tc, recvbuf);
+    if (!recvbuf)
+        return false;
+
+    testngap_recv(test_ue, recvbuf);
+    return true;
+}
+
+static bool send_ngap(abts_case *tc, fgc_gnb_t *gnb, ogs_pkbuf_t *sendbuf)
+{
+    int rv;
+
+    ABTS_PTR_NOTNULL(tc, sendbuf);
+    if (!sendbuf)
+        return false;
+
+    rv = testgnb_ngap_send(gnb->ngap, sendbuf);
+    ABTS_INT_EQUAL(tc, OGS_OK, rv);
+    return rv == OGS_OK;
+}
+
 /* gNB connects to AMF/UPF and completes NG Setup */
 static void gnb_setup(abts_case *tc, fgc_gnb_t *gnb)
 {
-    int rv;
-    ogs_pkbuf_t *sendbuf = NULL;
-    ogs_pkbuf_t *recvbuf = NULL;
     test_ue_t *test_ue = NULL;
 
     memset(gnb, 0, sizeof *gnb);
@@ -45,16 +69,12 @@ static void gnb_setup(abts_case *tc, fgc_gnb_t *gnb)
     gnb->gtpu = test_gtpu_server(1, AF_INET);
     ABTS_PTR_NOTNULL(tc, gnb->gtpu);
 
-    sendbuf = testngap_build_ng_setup_request(0x4000, 22);
-    ABTS_PTR_NOTNULL(tc, sendbuf);
-    rv = testgnb_ngap_send(gnb->ngap, sendbuf);
-    ABTS_INT_EQUAL(tc, OGS_OK, rv);
+    if (!send_ngap(tc, gnb, testngap_build_ng_setup_request(0x4000, 22)))
+        return;
 
     /* testngap_recv() needs a UE context even for the NG Setup Response */
     test_ue = ue_new(FGC_MSIN_1, 0);
-    recvbuf = testgnb_ngap_read(gnb->ngap);
-    ABTS_PTR_NOTNULL(tc, recvbuf);
-    testngap_recv(test_ue, recvbuf);
+    recv_ngap(tc, gnb, test_ue);
     test_ue_remove(test_ue);
 }
 
@@ -97,32 +117,41 @@ static test_ue_t *ue_new(const char *msin, uint32_t id_base)
     return test_ue;
 }
 
-/*
- * Provisions the subscriber, registers, establishes a PDU session of the
- * given type and runs router discovery.  Returns true when the UE is
- * ready for DHCPv6.
- */
-static bool attach_5gc(abts_case *tc, fgc_gnb_t *gnb,
-        const char *msin, uint32_t id_base,
-        int session_type, const char *static_ipv6, pd_ctx_t *ctx)
+/* Removes the subscriber and frees the test UE */
+static void ue_cleanup(abts_case *tc, test_ue_t *test_ue)
 {
-    int rv;
+    ABTS_INT_EQUAL(tc, OGS_OK, test_db_remove_ue(test_ue));
+    test_ue_remove(test_ue);
+}
+
+/*
+ * Provisions the subscriber, registers and requests a PDU session of the
+ * given type, up to (and including) the AMF's answer to the PDU Session
+ * Establishment Request: PDUSessionResourceSetupRequest with the Accept,
+ * or DownlinkNASTransport with the Reject.  test_ue/sess are always
+ * created.
+ */
+static bool attach_5gc_begin(abts_case *tc, fgc_gnb_t *gnb,
+        const char *msin, uint32_t id_base,
+        int session_type, const char *static_ipv6,
+        test_ue_t **test_ue_out, test_sess_t **sess_out)
+{
     ogs_pkbuf_t *gmmbuf = NULL;
     ogs_pkbuf_t *gsmbuf = NULL;
     ogs_pkbuf_t *nasbuf = NULL;
-    ogs_pkbuf_t *sendbuf = NULL;
-    ogs_pkbuf_t *recvbuf = NULL;
-    ogs_socknode_t *ngap = gnb->ngap;
-
     test_ue_t *test_ue = NULL;
     test_sess_t *sess = NULL;
-    test_bearer_t *qos_flow = NULL;
     bson_t *doc = NULL;
 
     ogs_assert(session_type == OGS_PDU_SESSION_TYPE_IPV6 ||
             session_type == OGS_PDU_SESSION_TYPE_IPV4V6);
 
     test_ue = ue_new(msin, id_base);
+    sess = test_sess_add_by_dnn_and_psi(test_ue, "internet", 5);
+    ogs_assert(sess);
+    sess->pdu_session_type = session_type;
+    *test_ue_out = test_ue;
+    *sess_out = sess;
 
     /********** Insert Subscriber in Database */
     if (static_ipv6)
@@ -145,90 +174,73 @@ static bool attach_5gc(abts_case *tc, fgc_gnb_t *gnb,
     nasbuf = testgmm_build_registration_request(test_ue, NULL, false, false);
     ABTS_PTR_NOTNULL(tc, nasbuf);
 
-    sendbuf = testngap_build_initial_ue_message(test_ue, gmmbuf,
-                NGAP_RRCEstablishmentCause_mo_Signalling, false, true);
-    ABTS_PTR_NOTNULL(tc, sendbuf);
-    rv = testgnb_ngap_send(ngap, sendbuf);
-    ABTS_INT_EQUAL(tc, OGS_OK, rv);
+    if (!send_ngap(tc, gnb, testngap_build_initial_ue_message(test_ue, gmmbuf,
+                NGAP_RRCEstablishmentCause_mo_Signalling, false, true)))
+        return false;
 
     /* Receive Identity request */
-    recvbuf = testgnb_ngap_read(ngap);
-    ABTS_PTR_NOTNULL(tc, recvbuf);
-    testngap_recv(test_ue, recvbuf);
+    if (!recv_ngap(tc, gnb, test_ue))
+        return false;
 
     /* Send Identity response */
     gmmbuf = testgmm_build_identity_response(test_ue);
     ABTS_PTR_NOTNULL(tc, gmmbuf);
-    sendbuf = testngap_build_uplink_nas_transport(test_ue, gmmbuf);
-    ABTS_PTR_NOTNULL(tc, sendbuf);
-    rv = testgnb_ngap_send(ngap, sendbuf);
-    ABTS_INT_EQUAL(tc, OGS_OK, rv);
+    if (!send_ngap(tc, gnb,
+                testngap_build_uplink_nas_transport(test_ue, gmmbuf)))
+        return false;
 
     /* Receive Authentication request */
-    recvbuf = testgnb_ngap_read(ngap);
-    ABTS_PTR_NOTNULL(tc, recvbuf);
-    testngap_recv(test_ue, recvbuf);
+    if (!recv_ngap(tc, gnb, test_ue))
+        return false;
 
     /* Send Authentication response */
     gmmbuf = testgmm_build_authentication_response(test_ue);
     ABTS_PTR_NOTNULL(tc, gmmbuf);
-    sendbuf = testngap_build_uplink_nas_transport(test_ue, gmmbuf);
-    ABTS_PTR_NOTNULL(tc, sendbuf);
-    rv = testgnb_ngap_send(ngap, sendbuf);
-    ABTS_INT_EQUAL(tc, OGS_OK, rv);
+    if (!send_ngap(tc, gnb,
+                testngap_build_uplink_nas_transport(test_ue, gmmbuf)))
+        return false;
 
     /* Receive Security mode command */
-    recvbuf = testgnb_ngap_read(ngap);
-    ABTS_PTR_NOTNULL(tc, recvbuf);
-    testngap_recv(test_ue, recvbuf);
+    if (!recv_ngap(tc, gnb, test_ue))
+        return false;
 
     /* Send Security mode complete */
     gmmbuf = testgmm_build_security_mode_complete(test_ue, nasbuf);
     ABTS_PTR_NOTNULL(tc, gmmbuf);
-    sendbuf = testngap_build_uplink_nas_transport(test_ue, gmmbuf);
-    ABTS_PTR_NOTNULL(tc, sendbuf);
-    rv = testgnb_ngap_send(ngap, sendbuf);
-    ABTS_INT_EQUAL(tc, OGS_OK, rv);
+    if (!send_ngap(tc, gnb,
+                testngap_build_uplink_nas_transport(test_ue, gmmbuf)))
+        return false;
 
     /* Receive InitialContextSetupRequest +
      * Registration accept */
-    recvbuf = testgnb_ngap_read(ngap);
-    ABTS_PTR_NOTNULL(tc, recvbuf);
-    testngap_recv(test_ue, recvbuf);
+    if (!recv_ngap(tc, gnb, test_ue))
+        return false;
     ABTS_INT_EQUAL(tc,
             NGAP_ProcedureCode_id_InitialContextSetup,
             test_ue->ngap_procedure_code);
 
     /* Send UERadioCapabilityInfoIndication */
-    sendbuf = testngap_build_ue_radio_capability_info_indication(test_ue);
-    ABTS_PTR_NOTNULL(tc, sendbuf);
-    rv = testgnb_ngap_send(ngap, sendbuf);
-    ABTS_INT_EQUAL(tc, OGS_OK, rv);
+    if (!send_ngap(tc, gnb,
+                testngap_build_ue_radio_capability_info_indication(test_ue)))
+        return false;
 
     /* Send InitialContextSetupResponse */
-    sendbuf = testngap_build_initial_context_setup_response(test_ue, false);
-    ABTS_PTR_NOTNULL(tc, sendbuf);
-    rv = testgnb_ngap_send(ngap, sendbuf);
-    ABTS_INT_EQUAL(tc, OGS_OK, rv);
+    if (!send_ngap(tc, gnb,
+                testngap_build_initial_context_setup_response(test_ue, false)))
+        return false;
 
     /* Send Registration complete */
     gmmbuf = testgmm_build_registration_complete(test_ue);
     ABTS_PTR_NOTNULL(tc, gmmbuf);
-    sendbuf = testngap_build_uplink_nas_transport(test_ue, gmmbuf);
-    ABTS_PTR_NOTNULL(tc, sendbuf);
-    rv = testgnb_ngap_send(ngap, sendbuf);
-    ABTS_INT_EQUAL(tc, OGS_OK, rv);
+    if (!send_ngap(tc, gnb,
+                testngap_build_uplink_nas_transport(test_ue, gmmbuf)))
+        return false;
 
     /* Receive Configuration update command */
-    recvbuf = testgnb_ngap_read(ngap);
-    ABTS_PTR_NOTNULL(tc, recvbuf);
-    testngap_recv(test_ue, recvbuf);
+    if (!recv_ngap(tc, gnb, test_ue))
+        return false;
 
     /* Send PDU session establishment request */
-    sess = test_sess_add_by_dnn_and_psi(test_ue, "internet", 5);
-    ogs_assert(sess);
-    sess->pdu_session_type = session_type;
-
     sess->ul_nas_transport_param.request_type =
         OGS_NAS_5GS_REQUEST_TYPE_INITIAL;
     sess->ul_nas_transport_param.dnn = 1;
@@ -242,37 +254,72 @@ static bool attach_5gc(abts_case *tc, fgc_gnb_t *gnb,
     gmmbuf = testgmm_build_ul_nas_transport(sess,
             OGS_NAS_PAYLOAD_CONTAINER_N1_SM_INFORMATION, gsmbuf);
     ABTS_PTR_NOTNULL(tc, gmmbuf);
-    sendbuf = testngap_build_uplink_nas_transport(test_ue, gmmbuf);
-    ABTS_PTR_NOTNULL(tc, sendbuf);
-    rv = testgnb_ngap_send(ngap, sendbuf);
-    ABTS_INT_EQUAL(tc, OGS_OK, rv);
+    if (!send_ngap(tc, gnb,
+                testngap_build_uplink_nas_transport(test_ue, gmmbuf)))
+        return false;
 
     /* Receive PDUSessionResourceSetupRequest +
      * DL NAS transport +
-     * PDU session establishment accept */
-    recvbuf = testgnb_ngap_read(ngap);
-    ABTS_PTR_NOTNULL(tc, recvbuf);
-    testngap_recv(test_ue, recvbuf);
+     * PDU session establishment accept
+     * (or DownlinkNASTransport with PDU session establishment reject) */
+    return recv_ngap(tc, gnb, test_ue);
+}
+
+/*
+ * Completes an accepted PDU session: PDUSessionResourceSetupResponse.
+ * Fills ctx (bearer may stay NULL on failure).
+ */
+static bool attach_5gc_finish(abts_case *tc, fgc_gnb_t *gnb,
+        test_ue_t *test_ue, test_sess_t *sess, int session_type,
+        pd_ctx_t *ctx)
+{
+    test_bearer_t *qos_flow = NULL;
+
     ABTS_INT_EQUAL(tc,
             NGAP_ProcedureCode_id_PDUSessionResourceSetup,
             test_ue->ngap_procedure_code);
-
-    /* Send PDUSessionResourceSetupResponse */
-    sendbuf = testngap_sess_build_pdu_session_resource_setup_response(sess);
-    ABTS_PTR_NOTNULL(tc, sendbuf);
-    rv = testgnb_ngap_send(ngap, sendbuf);
-    ABTS_INT_EQUAL(tc, OGS_OK, rv);
+    ABTS_INT_EQUAL(tc, OGS_NAS_5GS_PDU_SESSION_ESTABLISHMENT_ACCEPT,
+            test_ue->gsm_message_type);
 
     qos_flow = test_qos_flow_find_by_qfi(sess, 1);
-    ogs_assert(qos_flow);
+    pd_ctx_init(ctx, tc, gnb->gtpu, test_ue, sess, qos_flow);
+    ABTS_PTR_NOTNULL(tc, qos_flow);
+    if (!qos_flow)
+        return false;
+
+    /* Send PDUSessionResourceSetupResponse */
+    if (!send_ngap(tc, gnb,
+                testngap_sess_build_pdu_session_resource_setup_response(sess)))
+        return false;
 
     /* PDU session type as requested */
     ABTS_TRUE(tc, sess->ue_ip.ipv6);
     ABTS_INT_EQUAL(tc, session_type == OGS_PDU_SESSION_TYPE_IPV4V6,
             sess->ue_ip.ipv4);
 
-    pd_ctx_init(ctx, tc, gnb->gtpu, test_ue, sess, qos_flow);
-    if (!sess->ue_ip.ipv6)
+    return sess->ue_ip.ipv6;
+}
+
+/*
+ * Provisions the subscriber, registers, establishes a PDU session of the
+ * given type and runs router discovery.  Returns true when the UE is
+ * ready for DHCPv6; ctx is always initialised so that detach_5gc() can
+ * clean up.
+ */
+static bool attach_5gc(abts_case *tc, fgc_gnb_t *gnb,
+        const char *msin, uint32_t id_base,
+        int session_type, const char *static_ipv6, pd_ctx_t *ctx)
+{
+    test_ue_t *test_ue = NULL;
+    test_sess_t *sess = NULL;
+
+    if (!attach_5gc_begin(tc, gnb, msin, id_base,
+                session_type, static_ipv6, &test_ue, &sess)) {
+        pd_ctx_init(ctx, tc, gnb->gtpu, test_ue, sess, NULL);
+        return false;
+    }
+
+    if (!attach_5gc_finish(tc, gnb, test_ue, sess, session_type, ctx))
         return false;
 
     /* Send Router Solicitation, receive Router Advertisement
@@ -283,65 +330,103 @@ static bool attach_5gc(abts_case *tc, fgc_gnb_t *gnb,
 /* Releases the UE context, de-registers, removes the subscriber */
 static void detach_5gc(abts_case *tc, fgc_gnb_t *gnb, pd_ctx_t *ctx)
 {
-    int rv;
     ogs_pkbuf_t *gmmbuf = NULL;
-    ogs_pkbuf_t *sendbuf = NULL;
-    ogs_pkbuf_t *recvbuf = NULL;
-    ogs_socknode_t *ngap = gnb->ngap;
     test_ue_t *test_ue = ctx->test_ue;
 
-    /* Send UEContextReleaseRequest */
-    sendbuf = testngap_build_ue_context_release_request(test_ue,
+    if (!test_ue)
+        return;
+
+    /* Send UEContextReleaseRequest (with the PDU session list only when a
+     * session was actually established) */
+    if (!send_ngap(tc, gnb, testngap_build_ue_context_release_request(test_ue,
             NGAP_Cause_PR_radioNetwork, NGAP_CauseRadioNetwork_user_inactivity,
-            true);
-    ABTS_PTR_NOTNULL(tc, sendbuf);
-    rv = testgnb_ngap_send(ngap, sendbuf);
-    ABTS_INT_EQUAL(tc, OGS_OK, rv);
+            ctx->bearer != NULL)))
+        goto cleanup;
 
     /* Receive UEContextReleaseCommand */
-    recvbuf = testgnb_ngap_read(ngap);
-    ABTS_PTR_NOTNULL(tc, recvbuf);
-    testngap_recv(test_ue, recvbuf);
+    if (!recv_ngap(tc, gnb, test_ue))
+        goto cleanup;
     ABTS_INT_EQUAL(tc,
             NGAP_ProcedureCode_id_UEContextRelease,
             test_ue->ngap_procedure_code);
 
     /* Send UEContextReleaseComplete */
-    sendbuf = testngap_build_ue_context_release_complete(test_ue);
-    ABTS_PTR_NOTNULL(tc, sendbuf);
-    rv = testgnb_ngap_send(ngap, sendbuf);
-    ABTS_INT_EQUAL(tc, OGS_OK, rv);
+    if (!send_ngap(tc, gnb,
+                testngap_build_ue_context_release_complete(test_ue)))
+        goto cleanup;
 
     /* Send De-registration request */
     gmmbuf = testgmm_build_de_registration_request(test_ue, 1, true, false);
     ABTS_PTR_NOTNULL(tc, gmmbuf);
-    sendbuf = testngap_build_initial_ue_message(test_ue, gmmbuf,
-                NGAP_RRCEstablishmentCause_mo_Signalling, true, false);
-    ABTS_PTR_NOTNULL(tc, sendbuf);
-    rv = testgnb_ngap_send(ngap, sendbuf);
-    ABTS_INT_EQUAL(tc, OGS_OK, rv);
+    if (!send_ngap(tc, gnb, testngap_build_initial_ue_message(test_ue, gmmbuf,
+                NGAP_RRCEstablishmentCause_mo_Signalling, true, false)))
+        goto cleanup;
 
     /* Receive UEContextReleaseCommand */
-    recvbuf = testgnb_ngap_read(ngap);
-    ABTS_PTR_NOTNULL(tc, recvbuf);
-    testngap_recv(test_ue, recvbuf);
+    if (!recv_ngap(tc, gnb, test_ue))
+        goto cleanup;
     ABTS_INT_EQUAL(tc,
             NGAP_ProcedureCode_id_UEContextRelease,
             test_ue->ngap_procedure_code);
 
     /* Send UEContextReleaseComplete */
-    sendbuf = testngap_build_ue_context_release_complete(test_ue);
-    ABTS_PTR_NOTNULL(tc, sendbuf);
-    rv = testgnb_ngap_send(ngap, sendbuf);
-    ABTS_INT_EQUAL(tc, OGS_OK, rv);
+    send_ngap(tc, gnb, testngap_build_ue_context_release_complete(test_ue));
 
+cleanup:
     ogs_msleep(300);
 
-    /********** Remove Subscriber in Database */
-    ABTS_INT_EQUAL(tc, OGS_OK, test_db_remove_ue(test_ue));
-
-    test_ue_remove(test_ue);
+    ue_cleanup(tc, test_ue);
     ctx->test_ue = NULL;
+}
+
+/*
+ * DESIGN 5.3: a static UE IPv6 address outside every subnet of the DNN is
+ * refused by the SMF; the UE receives a PDU Session Establishment Reject
+ * (5GSM cause #67, insufficient resources for specific slice and DNN) in a
+ * DownlinkNASTransport and stays registered.  If the session is accepted
+ * instead, the test fails but still tears it down.
+ */
+static void attach_5gc_expect_reject(abts_case *tc, fgc_gnb_t *gnb,
+        const char *msin, uint32_t id_base, const char *static_ipv6)
+{
+    test_ue_t *test_ue = NULL;
+    test_sess_t *sess = NULL;
+    pd_ctx_t ctx;
+
+    if (!attach_5gc_begin(tc, gnb, msin, id_base,
+                OGS_PDU_SESSION_TYPE_IPV4V6, static_ipv6, &test_ue, &sess)) {
+        ue_cleanup(tc, test_ue);
+        return;
+    }
+
+    pd_ctx_init(&ctx, tc, gnb->gtpu, test_ue, sess, NULL);
+
+    if (test_ue->ngap_procedure_code ==
+            NGAP_ProcedureCode_id_DownlinkNASTransport &&
+        test_ue->gsm_message_type ==
+            OGS_NAS_5GS_PDU_SESSION_ESTABLISHMENT_REJECT) {
+
+        ABTS_INT_EQUAL(tc,
+                OGS_5GSM_CAUSE_INSUFFICIENT_RESOURCES_FOR_SPECIFIC_SLICE_AND_DNN,
+                test_ue->gsm_cause);
+
+        /* Still registered: release the context and de-register */
+        detach_5gc(tc, gnb, &ctx);
+        return;
+    }
+
+    ogs_error("Static UE IPv6 %s outside every subnet: expected PDU Session "
+            "Establishment Reject, got NGAP procedure[%d] GSM message[%d]",
+            static_ipv6, (int)test_ue->ngap_procedure_code,
+            test_ue->gsm_message_type);
+    ABTS_FAIL(tc, "PDU session with an orphan static address was accepted");
+
+    /* Complete the setup so that the session can be torn down cleanly */
+    if (test_ue->ngap_procedure_code ==
+            NGAP_ProcedureCode_id_PDUSessionResourceSetup)
+        attach_5gc_finish(tc, gnb, test_ue, sess,
+                OGS_PDU_SESSION_TYPE_IPV4V6, &ctx);
+    detach_5gc(tc, gnb, &ctx);
 }
 
 /*
@@ -459,7 +544,8 @@ static void reattach(abts_case *tc, void *data)
     gnb_close(&gnb);
 }
 
-/* Static UE IPv6 address: fixed /64 and /56, identical on re-attach */
+/* Static UE IPv6 address inside the dynamic cafe subnet (outside its
+ * range): fixed /64 and /56, identical on re-attach */
 static void static_pd(abts_case *tc, void *data)
 {
     fgc_gnb_t gnb;
@@ -488,6 +574,114 @@ static void static_pd(abts_case *tc, void *data)
     gnb_close(&gnb);
 }
 
+/* 5.1/5.6: RA with SLLA and the documented defaults, NS/NA for the gateway */
+static void neighbour_discovery(abts_case *tc, void *data)
+{
+    run_scenario(tc, OGS_PDU_SESSION_TYPE_IPV4V6,
+            pd_scenario_neighbour_discovery);
+}
+
+/* 5.7: RS from :: gets an RA to ff02::1 */
+static void rs_unspecified(abts_case *tc, void *data)
+{
+    run_scenario(tc, OGS_PDU_SESSION_TYPE_IPV6, pd_scenario_rs_unspecified);
+}
+
+/* 5.2 (UPF): leaked link-local LAN traffic is dropped, NFs stay alive */
+static void leaky_cpe(abts_case *tc, void *data)
+{
+    run_scenario(tc, OGS_PDU_SESSION_TYPE_IPV4V6, pd_scenario_leaky_cpe);
+}
+
+/* 5.2 (SMF): a second DUID cannot steal a live binding */
+static void sticky_binding(abts_case *tc, void *data)
+{
+    run_scenario(tc, OGS_PDU_SESSION_TYPE_IPV4V6, pd_scenario_sticky_binding);
+}
+
+/* 5.8: TP-Link HX220 fixtures */
+static void hx220(abts_case *tc, void *data)
+{
+    run_scenario(tc, OGS_PDU_SESSION_TYPE_IPV4V6, pd_scenario_hx220);
+}
+
+/* 5.3/5.5: static address in the static-only subnet; the UPF routes the
+ * block while the session exists and removes the route afterwards */
+static void static_only(abts_case *tc, void *data)
+{
+    fgc_gnb_t gnb;
+    pd_ctx_t ctx;
+    uint8_t link[OGS_IPV6_LEN], block[OGS_IPV6_LEN];
+    bool ok;
+
+    gnb_setup(tc, &gnb);
+
+    ok = attach_5gc(tc, &gnb, FGC_MSIN_1, 0,
+            OGS_PDU_SESSION_TYPE_IPV4V6, PD_STATIC_ONLY_UE_IPV6, &ctx);
+    if (ok)
+        pd_scenario_static_only(&ctx, true);
+    memcpy(link, ctx.link, OGS_IPV6_LEN);
+    memcpy(block, ctx.block, OGS_IPV6_LEN);
+    detach_5gc(tc, &gnb, &ctx);
+    pd_check_kernel_route(tc, PD_STATIC_ONLY_ROUTE, false);
+
+    if (attach_5gc(tc, &gnb, FGC_MSIN_1, 0,
+                OGS_PDU_SESSION_TYPE_IPV6, PD_STATIC_ONLY_UE_IPV6, &ctx)) {
+        pd_scenario_static_only(&ctx, false);
+        if (ok)
+            pd_check_same_prefixes(&ctx, link, block);
+    }
+    detach_5gc(tc, &gnb, &ctx);
+    pd_check_kernel_route(tc, PD_STATIC_ONLY_ROUTE, false);
+
+    gnb_close(&gnb);
+}
+
+/* 5.3: static address outside every subnet -> PDU Session Establishment
+ * Reject */
+static void static_orphan(abts_case *tc, void *data)
+{
+    fgc_gnb_t gnb;
+
+    gnb_setup(tc, &gnb);
+    attach_5gc_expect_reject(tc, &gnb, FGC_MSIN_1, 0,
+            PD_STATIC_ORPHAN_UE_IPV6);
+    gnb_close(&gnb);
+}
+
+/* 5.4: pool 1 holds one block; UE1 gets it, UE2 spills into pool 2, and
+ * after both de-register the next UE lands in pool 1 again */
+static void multi_pool(abts_case *tc, void *data)
+{
+    fgc_gnb_t gnb;
+    pd_ctx_t ctx1, ctx2;
+    bool ok1, ok2;
+
+    gnb_setup(tc, &gnb);
+
+    ok1 = attach_5gc(tc, &gnb, FGC_MSIN_1, 0,
+            OGS_PDU_SESSION_TYPE_IPV4V6, NULL, &ctx1);
+    ok2 = attach_5gc(tc, &gnb, FGC_MSIN_2, 100,
+            OGS_PDU_SESSION_TYPE_IPV6, NULL, &ctx2);
+
+    if (ok1)
+        pd_scenario_in_pool(&ctx1, PD_POOL1);
+    if (ok2)
+        pd_scenario_in_pool(&ctx2, PD_POOL2);
+    if (ok1 && ok2)
+        pd_check_distinct_blocks(&ctx1, &ctx2);
+
+    detach_5gc(tc, &gnb, &ctx2);
+    detach_5gc(tc, &gnb, &ctx1);
+
+    if (attach_5gc(tc, &gnb, FGC_MSIN_2, 200,
+                OGS_PDU_SESSION_TYPE_IPV4V6, NULL, &ctx1))
+        pd_scenario_in_pool(&ctx1, PD_POOL1);
+    detach_5gc(tc, &gnb, &ctx1);
+
+    gnb_close(&gnb);
+}
+
 abts_suite *test_5gc(abts_suite *suite)
 {
     suite = ADD_SUITE(suite)
@@ -505,6 +699,15 @@ abts_suite *test_5gc(abts_suite *suite)
     abts_run_test(suite, two_ues, NULL);
     abts_run_test(suite, reattach, NULL);
     abts_run_test(suite, static_pd, NULL);
+
+    abts_run_test(suite, neighbour_discovery, NULL);
+    abts_run_test(suite, rs_unspecified, NULL);
+    abts_run_test(suite, leaky_cpe, NULL);
+    abts_run_test(suite, sticky_binding, NULL);
+    abts_run_test(suite, hx220, NULL);
+    abts_run_test(suite, static_only, NULL);
+    abts_run_test(suite, static_orphan, NULL);
+    abts_run_test(suite, multi_pool, NULL);
 
     return suite;
 }

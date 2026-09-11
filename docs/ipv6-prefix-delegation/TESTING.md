@@ -38,20 +38,47 @@ simulated eNB/UE (S1AP + NAS-EPS) and gNB/UE (NGAP + NAS-5GS) against them
 and injects raw user-plane packets through GTP-U into the real UPF. The
 DHCPv6 client side is an independent implementation in
 `tests/common/dhcpv6.c`, so the server codec is cross-checked rather than
-tested against itself.
+tested against itself. Every read on the S1AP/NGAP and GTP-U sockets is
+bounded, so a missing answer fails the case instead of hanging the suite.
+
+The `internet` DNN of the test configuration has three IPv6 subnets, all
+with `prefix_delegation: 56`, in this order:
+
+| Subnet | Purpose |
+|---|---|
+| `2001:db8:beef::/48`, range `2001:db8:beef:100::0-2001:db8:beef:1ff::0` | Dynamic pool 1 with exactly one block (`2001:db8:beef:100::/56`). The first dynamic UE of every case lands here. |
+| `2001:db8:cafe::/48`, range `2001:db8:cafe:100::0-2001:db8:cafe:3fff::0` | Dynamic pool 2 (`2001:db8:cafe:100::/56` .. `2001:db8:cafe:3f00::/56`); the static subscriber `2001:db8:cafe:4200::1` is inside the subnet but outside the range. |
+| `2001:db8:5a7c::/48`, `static: true` | Static-only subnet: no pool, per-session kernel routes. Deliberately *not* configured on `ogstun` (`docker/devtest/setup-net.sh` only adds the cafe and beef gateways). |
+
+The SMF uses `dhcpv6.binding_policy: sticky`,
+`dhcpv6.information_refresh_time: 600` and
+`router_advertisement.link_layer_address: 02:00:00:00:01:01`.
 
 Per RAT (EPC and 5GC), for IPv4v6 and IPv6-only sessions:
 
 | Case | Checks |
 |---|---|
-| basic | RA: /64, M=0, O=1, A=1, L=0, RDNSS. Solicit → Advertise and Request → Reply: Server-ID, Client-ID echo, xid, IAID, T1/T2 (300/480), one IAPREFIX = the /56 containing the RA /64 with lifetimes 600/1200, PD_EXCLUDE = RA /64, DNS. Echo request from an address inside the /56 but outside the /64 is answered (UPF uplink acceptance + downlink block lookup). |
+| basic | RA: /64, M=0, O=1, A=1, L=0, RDNSS, plus the `router_advertisement` defaults pinned exactly (5.6): Source Link-Layer Address `02:00:00:00:01:01`, router lifetime 64800, hop limit 255. Solicit → Advertise and Request → Reply: Server-ID, Client-ID echo, xid, IAID, T1/T2 (300/480), one IAPREFIX = the /56 containing the RA /64 with lifetimes 600/1200, PD_EXCLUDE = RA /64, DNS. Echo request from an address inside the /56 but outside the /64 is answered (UPF uplink acceptance + downlink block lookup). |
 | lifecycle | Renew → Reply, Rebind → Reply, Release → Status Success, Renew after Release → NoBinding. |
 | no_exclude | Client without RFC 6603 gets the /57 half that does not contain the link /64; ping from it works. |
 | rapid_commit | Solicit + Rapid Commit → Reply with Rapid Commit; prefix usable. |
 | negative | Unicast Solicit → Advertise with UseMulticast; Request with a foreign Server-ID, Solicit carrying a Server-ID, random garbage and a truncated message → no reply and the NFs keep working; Information-request → DNS only; ping from a foreign /56 is dropped, ping from the own block still works. |
 | two_ues | Two concurrent UEs get distinct /64 and /56. |
 | reattach | Three attach/PD/detach cycles of the same UE (no leaked bindings or pool entries). |
-| static_pd | Subscriber with static UE IPv6 `2001:db8:cafe:4200::1`: RA /64 and delegated /56 are exactly `2001:db8:cafe:4200::/64` and `/56`, identical after re-attach; fallback half is `2001:db8:cafe:4280::/57`. |
+| static_pd | Subscriber with static UE IPv6 `2001:db8:cafe:4200::1` (inside the dynamic cafe subnet, outside its range): RA /64 and delegated /56 are exactly `2001:db8:cafe:4200::/64` and `/56`, identical after re-attach; fallback half is `2001:db8:cafe:4280::/57`. Statics nested in a dynamic subnet keep resolving to that subnet. |
+
+Second iteration (hardware findings, DESIGN section 5), also per RAT:
+
+| Case | Checks |
+|---|---|
+| neighbour_discovery | 5.1: NS for the RA source (`ra.src`) from the UE link-local to the solicited-node group, from the UE global (SLAAC) address, and unicast to the gateway (NUD re-probe) each get a unicast NA: hop limit 255, R\|S\|O set, target = `ra.src`, Target Link-Layer Address `02:00:00:00:01:01`, destination = the NS source. Silence (1 s) for a DAD probe from `::` for the UE's own address, for a DAD-style probe from `::` for the gateway address, and for an NS whose target is `fe80::2`. The gateway still answers afterwards. |
+| rs_unspecified | 5.7: RS from `::` → RA to `ff02::1` from the same router with the same /64, O=1, SLLA; a link-local RS afterwards still gets a unicast RA. |
+| leaky_cpe | 5.2 (UPF): a UDP datagram (mDNS-like, port 5353) and an echo request from the UE link-local to `2001:db8:cafe::1` get no reply; a ping from the delegated prefix works right after each, and RS→RA and Renew→Reply from link-local keep working. |
+| sticky_binding | 5.2 (SMF): client A binds; client B (another DUID) gets IA_PD `NoPrefixAvail` without a prefix on Solicit and Request, `NoBinding` on Renew; A's Renew still returns the same prefix; A releases (Success); B is then delegated the same block and can forward. |
+| hx220 | 5.8: byte-exact replay of the HX220 Information-request → Reply with DNS and Information Refresh Time 600, no IA; replay of the HX220 Solicit → Advertise with IAID `0xd0b8f19d`, T1/T2 300/480, one `/57` (no PD_EXCLUDE requested); a Request built with the same DUID → Reply and forwarding works; a Solicit carrying IA_NA(1) → Advertise with the delegation and Status `NoAddrsAvail` inside the IA_NA. The test codec parses the Vendor-Class option (16) as unknown and option 32. |
+| static_only | 5.3 + 5.5: static UE IPv6 `2001:db8:5a7c:4200::1` lands in the static-only subnet: RA /64 `2001:db8:5a7c:4200::/64`, block `/56`; `ip -6 route show proto 250` lists `2001:db8:5a7c:4200::/56` while attached and not after detach (twice, IPv4v6 then IPv6-only re-attach with identical prefixes); a ping from the delegated prefix is answered although nothing configured `2001:db8:5a7c::/48` on `ogstun`. |
+| static_orphan | 5.3: static UE IPv6 `2001:db8:dead::1` (outside every subnet) is rejected, not routed into the wrong pool: EPC Attach Reject with EMM cause #17 (network failure) followed by UE Context Release; 5GC PDU Session Establishment Reject with 5GSM cause #67 in a DownlinkNASTransport, the UE stays registered and de-registers cleanly. |
+| multi_pool | 5.4: UE1's block and delegated prefix are in `2001:db8:beef::/48`, UE2's in `2001:db8:cafe::/48`, both forward; after both detach a third UE lands in `2001:db8:beef::/48` again (no leak of the single block). |
 
 Unit tests (`meson test unit`): `tests/unit/dhcpv6-test.c` (codec
 round-trips, RFC 6603 example, rejection table, truncation at every offset,

@@ -63,11 +63,13 @@ extern const uint8_t test_dhcpv6_all_servers_addr[OGS_IPV6_LEN];
 #define TEST_DHCPV6_OPTION_ELAPSED_TIME         8
 #define TEST_DHCPV6_OPTION_STATUS_CODE          13
 #define TEST_DHCPV6_OPTION_RAPID_COMMIT         14
+#define TEST_DHCPV6_OPTION_VENDOR_CLASS         16      /* skipped */
 #define TEST_DHCPV6_OPTION_RECONF_ACCEPT        20
 #define TEST_DHCPV6_OPTION_DNS_SERVERS          23
 #define TEST_DHCPV6_OPTION_DOMAIN_LIST          24
 #define TEST_DHCPV6_OPTION_IA_PD                25
 #define TEST_DHCPV6_OPTION_IAPREFIX             26
+#define TEST_DHCPV6_OPTION_INFORMATION_REFRESH_TIME 32  /* RFC 8415 21.23 */
 #define TEST_DHCPV6_OPTION_PD_EXCLUDE           67
 #define TEST_DHCPV6_OPTION_SOL_MAX_RT           82
 #define TEST_DHCPV6_OPTION_INF_MAX_RT           83
@@ -83,6 +85,7 @@ extern const uint8_t test_dhcpv6_all_servers_addr[OGS_IPV6_LEN];
 
 #define TEST_DHCPV6_MAX_DUID_LEN                130
 #define TEST_DHCPV6_MAX_NUM_OF_IA_PD            4
+#define TEST_DHCPV6_MAX_NUM_OF_IA_NA            4
 #define TEST_DHCPV6_MAX_NUM_OF_IAPREFIX         4
 #define TEST_DHCPV6_MAX_NUM_OF_ORO              16
 #define TEST_DHCPV6_MAX_NUM_OF_DNS              4
@@ -124,6 +127,15 @@ typedef struct test_dhcpv6_ia_pd_s {
     test_dhcpv6_status_t status;
 } test_dhcpv6_ia_pd_t;
 
+/* IA_NA (RFC 8415 section 21.4); addresses are never requested nor parsed,
+ * only the Status Code the server puts inside the IA_NA matters here */
+typedef struct test_dhcpv6_ia_na_s {
+    uint32_t iaid;
+    uint32_t t1;
+    uint32_t t2;
+    test_dhcpv6_status_t status;
+} test_dhcpv6_ia_na_t;
+
 typedef struct test_dhcpv6_msg_s {
     uint8_t msg_type;
     uint32_t transaction_id;            /* 24 bit */
@@ -134,6 +146,8 @@ typedef struct test_dhcpv6_msg_s {
     int num_of_ia_pd;
     test_dhcpv6_ia_pd_t ia_pd[TEST_DHCPV6_MAX_NUM_OF_IA_PD];
     bool ia_na_presence;                /* parser only: IA_NA/IA_TA seen */
+    int num_of_ia_na;
+    test_dhcpv6_ia_na_t ia_na[TEST_DHCPV6_MAX_NUM_OF_IA_NA];
 
     int num_of_oro;
     uint16_t oro[TEST_DHCPV6_MAX_NUM_OF_ORO];
@@ -152,6 +166,11 @@ typedef struct test_dhcpv6_msg_s {
 
     int num_of_dns;
     uint8_t dns[TEST_DHCPV6_MAX_NUM_OF_DNS][OGS_IPV6_LEN];
+
+    struct {                            /* OPTION_INFORMATION_REFRESH_TIME */
+        bool presence;
+        uint32_t value;
+    } information_refresh_time;
 } test_dhcpv6_msg_t;
 
 /* Returns the number of bytes written, or -1 if buf is too small */

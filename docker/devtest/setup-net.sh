@@ -6,4 +6,6 @@ if ! grep -q "ogstun" /proc/net/dev; then
 fi
 ip addr replace 10.45.0.1/16 dev ogstun
 ip addr replace 2001:db8:cafe::1/48 dev ogstun
+ip addr replace 2001:db8:beef::1/48 dev ogstun
+# 2001:db8:5a7c::/48 is intentionally absent: the UPF routes it per session.
 ip link set ogstun up

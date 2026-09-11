@@ -34,8 +34,12 @@ ogs_socknode_t *testngap_client(int index, int family);
 int testsctp_send(ogs_socknode_t *node, ogs_pkbuf_t *pkbuf,
         int ppid, uint16_t stream_no, int type);
 ogs_pkbuf_t *testsctp_read(ogs_socknode_t *node, int type);
+/* Like testsctp_read() but returns NULL when nothing arrives in time */
+ogs_pkbuf_t *testsctp_read_timeout(
+        ogs_socknode_t *node, int type, int timeout_ms);
 
 #define testenb_s1ap_read(x) testsctp_read(x, 0);
+#define testenb_s1ap_read_timeout(x, ms) testsctp_read_timeout(x, 0, ms)
 #define testenb_s1ap_send(x, y) \
     testsctp_send(x, y, OGS_SCTP_S1AP_PPID, 0, 0)
 #define testenb_s1ap_close ogs_socknode_free
@@ -47,6 +51,7 @@ ogs_pkbuf_t *testsctp_read(ogs_socknode_t *node, int type);
 #define testvlr_sgsap_close ogs_socknode_free
 
 #define testgnb_ngap_read(x) testsctp_read(x, 0);
+#define testgnb_ngap_read_timeout(x, ms) testsctp_read_timeout(x, 0, ms)
 #define testgnb_ngap_send(x, y) \
     testsctp_send(x, y, OGS_SCTP_NGAP_PPID, 0, 0)
 #define testgnb_ngap_close ogs_socknode_free

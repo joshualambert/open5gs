@@ -600,6 +600,11 @@ int test_gtpu_send_indirect_data_forwarding(
 
 #define TEST_ND_OPT_RDNSS 25            /* RFC 8106 */
 
+static const uint8_t all_routers_addr[OGS_IPV6_LEN] = {
+    0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02
+};
+static const uint8_t unspecified_addr[OGS_IPV6_LEN];
+
 typedef struct test_udp_hdr_s {
     uint16_t src;
     uint16_t dst;
@@ -690,6 +695,36 @@ void test_gtpu_link_local(test_sess_t *sess, uint8_t *addr6)
     memcpy(addr6 + 8, sess->ue_ip.addr6 + 8, 8);
 }
 
+void test_gtpu_solicited_node(const uint8_t *addr6, uint8_t *out6)
+{
+    ogs_assert(addr6);
+    ogs_assert(out6);
+
+    memset(out6, 0, OGS_IPV6_LEN);
+    out6[0] = 0xff;
+    out6[1] = 0x02;
+    out6[11] = 0x01;
+    out6[12] = 0xff;
+    memcpy(out6 + 13, addr6 + 13, 3);
+}
+
+void test_gtpu_mac(test_sess_t *sess, uint8_t *mac)
+{
+    const uint8_t *iid = NULL;
+
+    ogs_assert(sess);
+    ogs_assert(mac);
+
+    /* EUI-64 -> MAC-48 (drop ff:fe, toggle the U/L bit) */
+    iid = sess->ue_ip.addr6 + 8;
+    mac[0] = iid[0] ^ 0x02;
+    mac[1] = iid[1];
+    mac[2] = iid[2];
+    mac[3] = iid[5];
+    mac[4] = iid[6];
+    mac[5] = iid[7];
+}
+
 static ogs_pkbuf_t *ipv6_pkbuf_alloc(size_t len)
 {
     ogs_pkbuf_t *pkbuf = NULL;
@@ -751,10 +786,11 @@ int test_gtpu_send_ipv6(
     return test_gtpu_send(node, bearer, &header_desc, ip6pkt);
 }
 
-int test_gtpu_send_dhcpv6(
+int test_gtpu_send_udp(
         ogs_socknode_t *node, test_bearer_t *bearer,
         const uint8_t *src6, const uint8_t *dst6,
-        const void *dhcp, size_t dhcp_len)
+        uint16_t src_port, uint16_t dst_port,
+        const void *payload, size_t payload_len)
 {
     test_sess_t *sess = NULL;
     ogs_pkbuf_t *pkbuf = NULL;
@@ -766,25 +802,24 @@ int test_gtpu_send_dhcpv6(
     ogs_assert(bearer);
     sess = bearer->sess;
     ogs_assert(sess);
-    ogs_assert(dhcp || dhcp_len == 0);
+    ogs_assert(dst6);
+    ogs_assert(payload || payload_len == 0);
 
     if (!src6) {
         test_gtpu_link_local(sess, link_local);
         src6 = link_local;
     }
-    if (!dst6)
-        dst6 = test_dhcpv6_all_servers_addr;
 
-    udp_len = sizeof *udp_h + dhcp_len;
+    udp_len = sizeof *udp_h + payload_len;
     pkbuf = ipv6_pkbuf_alloc(sizeof *ip6_h + udp_len);
 
     ip6_h = (struct ip6_hdr *)pkbuf->data;
     udp_h = (test_udp_hdr_t *)(ip6_h + 1);
-    if (dhcp_len)
-        memcpy(udp_h + 1, dhcp, dhcp_len);
+    if (payload_len)
+        memcpy(udp_h + 1, payload, payload_len);
 
-    udp_h->src = htobe16(TEST_DHCPV6_CLIENT_PORT);
-    udp_h->dst = htobe16(TEST_DHCPV6_SERVER_PORT);
+    udp_h->src = htobe16(src_port);
+    udp_h->dst = htobe16(dst_port);
     udp_h->len = htobe16(udp_len);
     udp_h->cksum = 0;
     udp_h->cksum = test_in6_cksum(src6, dst6, IPPROTO_UDP, udp_h, udp_len);
@@ -794,6 +829,119 @@ int test_gtpu_send_dhcpv6(
     ipv6_header_init(ip6_h, src6, dst6, IPPROTO_UDP, udp_len, 255);
 
     return test_gtpu_send_ipv6(node, bearer, pkbuf);
+}
+
+int test_gtpu_send_dhcpv6(
+        ogs_socknode_t *node, test_bearer_t *bearer,
+        const uint8_t *src6, const uint8_t *dst6,
+        const void *dhcp, size_t dhcp_len)
+{
+    if (!dst6)
+        dst6 = test_dhcpv6_all_servers_addr;
+
+    return test_gtpu_send_udp(node, bearer, src6, dst6,
+            TEST_DHCPV6_CLIENT_PORT, TEST_DHCPV6_SERVER_PORT, dhcp, dhcp_len);
+}
+
+/*
+ * ICMPv6 Neighbour Discovery message: type/code/checksum, body_len bytes
+ * of body (starting with the 4 reserved/flags octets), optionally a
+ * link-layer address option (type 1 = source, 2 = target) carrying the UE
+ * MAC. Hop limit 255 as RFC 4861 requires.
+ */
+static ogs_pkbuf_t *nd_pkbuf(test_sess_t *sess,
+        const uint8_t *src6, const uint8_t *dst6,
+        uint8_t type, const void *body, size_t body_len, uint8_t lladdr_type)
+{
+    ogs_pkbuf_t *pkbuf = NULL;
+    struct ip6_hdr *ip6_h = NULL;
+    struct icmp6_hdr *icmp6_h = NULL;
+    uint8_t *p = NULL;
+    size_t plen;
+
+    plen = 4 + body_len + (lladdr_type ? 8 : 0);
+    pkbuf = ipv6_pkbuf_alloc(sizeof *ip6_h + plen);
+
+    ip6_h = (struct ip6_hdr *)pkbuf->data;
+    icmp6_h = (struct icmp6_hdr *)(ip6_h + 1);
+    icmp6_h->icmp6_type = type;
+    icmp6_h->icmp6_code = 0;
+
+    p = (uint8_t *)icmp6_h + 4;
+    if (body_len) {
+        memcpy(p, body, body_len);
+        p += body_len;
+    }
+    if (lladdr_type) {
+        p[0] = lladdr_type;
+        p[1] = 1;       /* 8 octets */
+        test_gtpu_mac(sess, p + 2);
+    }
+
+    icmp6_h->icmp6_cksum = 0;
+    icmp6_h->icmp6_cksum = test_in6_cksum(src6, dst6,
+            IPPROTO_ICMPV6, icmp6_h, plen);
+
+    ipv6_header_init(ip6_h, src6, dst6, IPPROTO_ICMPV6, plen, 255);
+
+    return pkbuf;
+}
+
+int test_gtpu_send_rs_from(
+        ogs_socknode_t *node, test_bearer_t *bearer, const uint8_t *src6)
+{
+    test_sess_t *sess = NULL;
+    uint8_t link_local[OGS_IPV6_LEN];
+    uint8_t reserved[4] = { 0, 0, 0, 0 };
+    bool unspecified;
+
+    ogs_assert(bearer);
+    sess = bearer->sess;
+    ogs_assert(sess);
+
+    if (!src6) {
+        test_gtpu_link_local(sess, link_local);
+        src6 = link_local;
+    }
+    unspecified = memcmp(src6, unspecified_addr, OGS_IPV6_LEN) == 0;
+
+    return test_gtpu_send_ipv6(node, bearer,
+            nd_pkbuf(sess, src6, all_routers_addr, ND_ROUTER_SOLICIT,
+                reserved, sizeof reserved,
+                unspecified ? 0 : ND_OPT_SOURCE_LINKADDR));
+}
+
+int test_gtpu_send_ns(
+        ogs_socknode_t *node, test_bearer_t *bearer,
+        const uint8_t *src6, const uint8_t *dst6, const uint8_t *target6)
+{
+    test_sess_t *sess = NULL;
+    uint8_t link_local[OGS_IPV6_LEN], solicited_node[OGS_IPV6_LEN];
+    uint8_t body[4 + OGS_IPV6_LEN];
+    bool unspecified;
+
+    ogs_assert(bearer);
+    sess = bearer->sess;
+    ogs_assert(sess);
+    ogs_assert(target6);
+
+    if (!src6) {
+        test_gtpu_link_local(sess, link_local);
+        src6 = link_local;
+    }
+    if (!dst6) {
+        test_gtpu_solicited_node(target6, solicited_node);
+        dst6 = solicited_node;
+    }
+    unspecified = memcmp(src6, unspecified_addr, OGS_IPV6_LEN) == 0;
+
+    memset(body, 0, 4);                     /* reserved */
+    memcpy(body + 4, target6, OGS_IPV6_LEN);
+
+    return test_gtpu_send_ipv6(node, bearer,
+            nd_pkbuf(sess, src6, dst6, ND_NEIGHBOR_SOLICIT,
+                body, sizeof body,
+                unspecified ? 0 : ND_OPT_SOURCE_LINKADDR));
 }
 
 int test_gtpu_send_ping_from(
@@ -970,6 +1118,13 @@ int test_gtpu_parse_ra(ogs_pkbuf_t *pkbuf, test_gtpu_ra_t *ra)
             }
             ra->has_mtu = true;
             ra->mtu = be32toh(mtu->nd_opt_mtu_mtu);
+        } else if (type == ND_OPT_SOURCE_LINKADDR) {
+            if (olen != 8) {
+                ogs_error("Invalid SLLA option length [%zu]", olen);
+                return OGS_ERROR;
+            }
+            ra->has_slla = true;
+            memcpy(ra->slla, p + 2, 6);
         } else if (type == TEST_ND_OPT_RDNSS) {
             size_t i, n;
             uint32_t lifetime;
@@ -985,6 +1140,80 @@ int test_gtpu_parse_ra(ogs_pkbuf_t *pkbuf, test_gtpu_ra_t *ra)
                 memcpy(ra->rdnss[ra->num_of_rdnss++],
                         p + 8 + i * OGS_IPV6_LEN, OGS_IPV6_LEN);
             }
+        }
+
+        p += olen;
+        remaining -= olen;
+    }
+
+    return OGS_OK;
+}
+
+int test_gtpu_parse_na(ogs_pkbuf_t *pkbuf, test_gtpu_na_t *na)
+{
+    struct ip6_hdr *ip6_h = NULL;
+    struct icmp6_hdr *icmp6_h = NULL;
+    uint8_t *payload = NULL, *p = NULL;
+    size_t payload_len, remaining;
+    const size_t na_len = 8 + OGS_IPV6_LEN;    /* header + flags + target */
+
+    ogs_assert(pkbuf);
+    ogs_assert(na);
+
+    memset(na, 0, sizeof *na);
+
+    if (test_gtpu_parse_ipv6(pkbuf, &ip6_h, &payload, &payload_len) != OGS_OK)
+        return OGS_ERROR;
+
+    if (ip6_h->ip6_nxt != IPPROTO_ICMPV6) {
+        ogs_error("Not ICMPv6: next header[%d]", ip6_h->ip6_nxt);
+        return OGS_ERROR;
+    }
+    if (payload_len < na_len) {
+        ogs_error("Short ICMPv6 payload [%zu]", payload_len);
+        return OGS_ERROR;
+    }
+
+    icmp6_h = (struct icmp6_hdr *)payload;
+    if (icmp6_h->icmp6_type != ND_NEIGHBOR_ADVERT || icmp6_h->icmp6_code) {
+        ogs_error("Not a Neighbour Advertisement: type[%d] code[%d]",
+                icmp6_h->icmp6_type, icmp6_h->icmp6_code);
+        return OGS_ERROR;
+    }
+
+    if (test_in6_cksum(ip6_h->ip6_src.s6_addr, ip6_h->ip6_dst.s6_addr,
+                IPPROTO_ICMPV6, payload, payload_len) != 0) {
+        ogs_error("Neighbour Advertisement checksum mismatch");
+        return OGS_ERROR;
+    }
+
+    memcpy(na->src, ip6_h->ip6_src.s6_addr, OGS_IPV6_LEN);
+    memcpy(na->dst, ip6_h->ip6_dst.s6_addr, OGS_IPV6_LEN);
+    na->hlim = ip6_h->ip6_hlim;
+    /* R|S|O live in the first octet of the "flags/reserved" word */
+    na->flags = payload[4] & (TEST_ND_NA_FLAG_ROUTER |
+            TEST_ND_NA_FLAG_SOLICITED | TEST_ND_NA_FLAG_OVERRIDE);
+    memcpy(na->target, payload + 8, OGS_IPV6_LEN);
+
+    p = payload + na_len;
+    remaining = payload_len - na_len;
+
+    while (remaining >= 8) {
+        uint8_t type = p[0];
+        size_t olen = (size_t)p[1] * 8;
+
+        if (olen == 0 || olen > remaining) {
+            ogs_error("Invalid ND option: type[%d] len[%zu]", type, olen);
+            return OGS_ERROR;
+        }
+
+        if (type == ND_OPT_TARGET_LINKADDR) {
+            if (olen != 8) {
+                ogs_error("Invalid TLLA option length [%zu]", olen);
+                return OGS_ERROR;
+            }
+            na->has_tlla = true;
+            memcpy(na->tlla, p + 2, 6);
         }
 
         p += olen;

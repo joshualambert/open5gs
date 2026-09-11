@@ -19,6 +19,8 @@
 
 #include "test-common.h"
 
+#include <poll.h>
+
 ogs_socknode_t *testsctp_server(const char *ipstr, int port)
 {
     int rv;
@@ -153,6 +155,35 @@ ogs_pkbuf_t *testsctp_read(ogs_socknode_t *node, int type)
 
     ogs_pkbuf_trim(recvbuf, size);
     return recvbuf;;
+}
+
+ogs_pkbuf_t *testsctp_read_timeout(
+        ogs_socknode_t *node, int type, int timeout_ms)
+{
+    struct pollfd pfd;
+    int rc;
+
+    ogs_assert(node);
+    ogs_assert(node->sock);
+
+    memset(&pfd, 0, sizeof pfd);
+    pfd.fd = node->sock->fd;
+    pfd.events = POLLIN;
+
+    do {
+        rc = poll(&pfd, 1, timeout_ms);
+    } while (rc < 0 && errno == EINTR);
+
+    if (rc == 0) {
+        ogs_error("No SCTP message within %d ms", timeout_ms);
+        return NULL;
+    }
+    if (rc < 0) {
+        ogs_log_message(OGS_LOG_ERROR, ogs_socket_errno, "poll() failed");
+        return NULL;
+    }
+
+    return testsctp_read(node, type);
 }
 
 int testsctp_send(ogs_socknode_t *node, ogs_pkbuf_t *pkbuf,

@@ -147,6 +147,18 @@ static void put_ia_pd(cursor_t *c, const test_dhcpv6_ia_pd_t *ia_pd)
     end_option(c, start);
 }
 
+static void put_ia_na(cursor_t *c, const test_dhcpv6_ia_na_t *ia_na)
+{
+    size_t start;
+
+    start = begin_option(c, TEST_DHCPV6_OPTION_IA_NA);
+    put32(c, ia_na->iaid);
+    put32(c, ia_na->t1);
+    put32(c, ia_na->t2);
+    put_status(c, &ia_na->status);
+    end_option(c, start);
+}
+
 int test_dhcpv6_build(
         const test_dhcpv6_msg_t *msg, uint8_t *buf, size_t buflen)
 {
@@ -193,10 +205,19 @@ int test_dhcpv6_build(
         end_option(&c, start);
     }
 
+    for (i = 0; i < msg->num_of_ia_na && i < TEST_DHCPV6_MAX_NUM_OF_IA_NA; i++)
+        put_ia_na(&c, &msg->ia_na[i]);
+
     for (i = 0; i < msg->num_of_ia_pd && i < TEST_DHCPV6_MAX_NUM_OF_IA_PD; i++)
         put_ia_pd(&c, &msg->ia_pd[i]);
 
     put_status(&c, &msg->status);
+
+    if (msg->information_refresh_time.presence) {
+        start = begin_option(&c, TEST_DHCPV6_OPTION_INFORMATION_REFRESH_TIME);
+        put32(&c, msg->information_refresh_time.value);
+        end_option(&c, start);
+    }
 
     if (msg->num_of_dns) {
         start = begin_option(&c, TEST_DHCPV6_OPTION_DNS_SERVERS);
@@ -353,12 +374,58 @@ static int parse_ia_pd(test_dhcpv6_msg_t *msg, const uint8_t *p, size_t n)
     return OGS_OK;
 }
 
+static int parse_ia_na(test_dhcpv6_msg_t *msg, const uint8_t *p, size_t n)
+{
+    test_dhcpv6_ia_na_t *ia_na = NULL;
+    size_t pos = 0;
+
+    if (n < 12)
+        return OGS_ERROR;
+    msg->ia_na_presence = true;
+    if (msg->num_of_ia_na >= TEST_DHCPV6_MAX_NUM_OF_IA_NA)
+        return OGS_OK;  /* beyond our limits: ignored */
+
+    ia_na = &msg->ia_na[msg->num_of_ia_na];
+    memset(ia_na, 0, sizeof *ia_na);
+    ia_na->iaid = get32(p);
+    ia_na->t1 = get32(p+4);
+    ia_na->t2 = get32(p+8);
+    pos = 12;
+
+    while (pos < n) {
+        uint16_t code, olen;
+
+        if (n - pos < 4)
+            return OGS_ERROR;
+        code = get16(p+pos);
+        olen = get16(p+pos+2);
+        pos += 4;
+        if (olen > n - pos)
+            return OGS_ERROR;
+
+        switch (code) {
+        case TEST_DHCPV6_OPTION_STATUS_CODE:
+            if (parse_status(&ia_na->status, p+pos, olen) != OGS_OK)
+                return OGS_ERROR;
+            break;
+        default:
+            /* IAADDR and anything else: we never asked for addresses */
+            break;
+        }
+        pos += olen;
+    }
+
+    msg->num_of_ia_na++;
+    return OGS_OK;
+}
+
 int test_dhcpv6_parse(
         test_dhcpv6_msg_t *msg, const uint8_t *data, size_t len)
 {
     size_t pos = 0;
     bool elapsed_seen = false, rapid_seen = false;
     bool oro_seen = false, dns_seen = false, pref_seen = false;
+    bool irt_seen = false;
     int i;
 
     ogs_assert(msg);
@@ -395,8 +462,22 @@ int test_dhcpv6_parse(
                 return OGS_ERROR;
             break;
         case TEST_DHCPV6_OPTION_IA_NA:
+            if (parse_ia_na(msg, p, olen) != OGS_OK)
+                return OGS_ERROR;
+            break;
         case TEST_DHCPV6_OPTION_IA_TA:
             msg->ia_na_presence = true;
+            break;
+        case TEST_DHCPV6_OPTION_VENDOR_CLASS:
+            /* enterprise-number + vendor-class-data: skipped like any
+             * other option we do not understand (HX220 sends it) */
+            break;
+        case TEST_DHCPV6_OPTION_INFORMATION_REFRESH_TIME:
+            if (irt_seen || olen != 4)
+                return OGS_ERROR;
+            irt_seen = true;
+            msg->information_refresh_time.presence = true;
+            msg->information_refresh_time.value = get32(p);
             break;
         case TEST_DHCPV6_OPTION_ORO:
             if (oro_seen || (olen % 2))

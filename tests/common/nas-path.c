@@ -95,6 +95,8 @@ void testgsm_recv(test_sess_t *sess, ogs_pkbuf_t *pkbuf)
                 &message.gsm.pdu_session_establishment_accept);
         break;
     case OGS_NAS_5GS_PDU_SESSION_ESTABLISHMENT_REJECT:
+        test_ue->gsm_cause =
+            message.gsm.pdu_session_establishment_reject.gsm_cause;
         break;
     case OGS_NAS_5GS_PDU_SESSION_MODIFICATION_COMMAND:
         testgsm_handle_pdu_session_modification_command(sess,
@@ -158,6 +160,7 @@ void testemm_recv(test_ue_t *test_ue, ogs_pkbuf_t *pkbuf)
         testemm_handle_attach_accept(test_ue, &message.emm.attach_accept);
         break;
     case OGS_NAS_EPS_ATTACH_REJECT:
+        test_ue->emm_cause = message.emm.attach_reject.emm_cause;
         break;
     case OGS_NAS_EPS_SERVICE_REJECT:
         break;
