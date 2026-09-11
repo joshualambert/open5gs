@@ -158,6 +158,39 @@ smf:                                  # identical `session:` list in upf.yaml
   `preferred_lifetime`, 2880 s) or the binding's `valid_lifetime` expires; a
   subscriber kick (Cancel-Location → re-attach) clears it immediately.
 
+### Neighbour Discovery, RA and binding knobs (second iteration)
+
+Found on hardware behind an IP-passthrough CPE (see DESIGN.md §5). All keys
+are optional; the defaults are what ships.
+
+| Key | Default | Why this default |
+|---|---|---|
+| `smf.router_advertisement.source_link_layer_address` | `true` | A router with an Ethernet WAN must resolve the gateway `fe80::1` to a MAC; the SLLA in the RA saves it the Neighbour Solicitation. |
+| `smf.router_advertisement.link_layer_address` | `02:00:00:00:01:01` | Virtual MAC used in the RA SLLA and in Neighbour Advertisements; locally administered, proven on hardware that the value does not matter. Multicast MACs are rejected. |
+| `smf.router_advertisement.other_config` | `auto` | O=1 whenever there is something to fetch by DHCPv6 (a delegated block or IPv6 DNS), else 0. `true`/`false` force it. |
+| `smf.router_advertisement.on_link` | `false` | TS 29.061 §11.2.1.3.2: the 3GPP link is point-to-point, no on-link determination. Stock Open5GS sends `true`; set it to compare CPE behaviour. |
+| `smf.router_advertisement.rdnss` | `true` | RFC 8106 DNS in the RA so SLAAC-only hosts get resolvers without DHCPv6. |
+| `smf.router_advertisement.router_lifetime` | `64800` | Unchanged from stock Open5GS (18 h). |
+| `smf.dhcpv6.binding_policy` | `sticky` | A leaky CPE forwards LAN DHCPv6 onto the bearer; with `replace` any LAN host could take the router's delegation. Sticky refuses foreign DUIDs while the bound client is alive. |
+| `smf.dhcpv6.information_refresh_time` | `86400` | RFC 8415 §21.23 for Information-request clients (the HX220 asks for option 32); minimum 600. |
+| `smf.session[].static` / `upf.session[].static` | `false` | Marks a statics-only subnet: no dynamic pool, chosen by containment, UPF installs a per-session kernel route (proto 250). |
+
+Sticky binding rule: a foreign DUID is refused (IA_PD `NoPrefixAvail`, or
+`NoBinding` for Renew/Rebind) while the bound client has been seen within T2
+and the binding's valid lifetime has not run out; a Release from the bound
+client frees it at once. UPF side: uplink packets from a link-local or
+unspecified source are forwarded only when they match a control-plane rule
+(RS, NS for the gateway, DHCPv6); everything else from such sources is
+dropped and counted (`upf_ul_drop_link_local`), so a LAN device behind a
+leaky CPE can never inject traffic or obtain an address from the core.
+
+What the SMF answers on the link now: RS (from a unicast source or from
+`::`, RA to the source or to `ff02::1` respectively) with Prefix
+Information, MTU, SLLA and RDNSS; NS for its own link-local (multicast
+solicited-node or unicast NUD probe) with a unicast NA (R, S, O set, TLLA);
+DHCPv6 Solicit/Request/Renew/Rebind/Release/Information-request. DAD probes
+(NS from `::`) and NS for other targets are ignored.
+
 ### N6 routing
 
 The whole pool subnet (`2001:db8:cafe::/48` above) must be routed to the UPF
