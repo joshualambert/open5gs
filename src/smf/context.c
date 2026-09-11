@@ -2378,9 +2378,28 @@ uint8_t smf_sess_set_ue_ip(smf_sess_t *sess)
         ogs_pfcp_subnet_t *subnet = NULL;
         ogs_pfcp_subnet_t *subnet6 = NULL;
 
+        uint8_t zero6[OGS_IPV6_LEN];
+
         ogs_assert(sess->session.name);
-        subnet = ogs_pfcp_find_subnet_by_dnn(AF_INET, sess->session.name);
-        subnet6 = ogs_pfcp_find_subnet_by_dnn(AF_INET6, sess->session.name);
+        memset(zero6, 0, sizeof zero6);
+
+        /*
+         * A family is available when a dynamic pool of the DNN has a free
+         * entry, or when the subscriber has a static address that some
+         * subnet of the DNN contains (including `static: true` subnets,
+         * which have no pool). The static address itself is resolved by
+         * containment in ogs_pfcp_ue_ip_alloc() (DESIGN.md 5.3, 5.5).
+         */
+        if (sess->session.ue_ip.addr)
+            subnet = ogs_pfcp_find_subnet_by_addr(AF_INET,
+                    sess->session.name, (uint8_t *)&sess->session.ue_ip.addr);
+        else
+            subnet = ogs_pfcp_find_subnet_by_dnn(AF_INET, sess->session.name);
+        if (memcmp(sess->session.ue_ip.addr6, zero6, OGS_IPV6_LEN) != 0)
+            subnet6 = ogs_pfcp_find_subnet_by_addr(AF_INET6,
+                    sess->session.name, sess->session.ue_ip.addr6);
+        else
+            subnet6 = ogs_pfcp_find_subnet_by_dnn(AF_INET6, sess->session.name);
 
         if (subnet != NULL && subnet6 == NULL) {
             sess->session.session_type = OGS_PDU_SESSION_TYPE_IPV4;
