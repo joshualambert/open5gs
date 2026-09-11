@@ -133,3 +133,20 @@ Validated in Docker on Ubuntu 24.04 (Noble), 2026-09-10:
 Hardware validation (Global Telecom Titan 4000, Nokia FastMile 5G-16A in
 IP passthrough on an HX510) is performed separately following the "Testing
 with real hardware" steps above.
+
+### Second iteration (2026-09-11): hardware findings
+
+Covers DESIGN.md §5 (Neighbour Advertisement for the gateway, SLLA in the
+RA, RS from `::`, CP-only acceptance of link-local sources, sticky
+bindings, static-address containment, static-only subnets with per-session
+kernel routes, several pools per DNN, HX220 fixtures).
+
+* Full Open5GS suite: 17/17 pass; `ipv6-pd` grew to 42 cases (21 per RAT)
+  and ran green three times back to back.
+* ASan + UBSan on the integrated tree: `ipv6-pd` passes, and the `dhcpv6`
+  and `pfcp-ue-ip` unit suites pass with leak detection; no finding in any
+  file touched by this work (the same pre-existing NAS/ASN.1 notes and the
+  freeDiameter ODR false positive remain).
+* Per-session kernel routes were verified both by the suite (route present
+  while attached, gone after detach, downlink echo through it) and manually
+  (stale proto-250 routes flushed at UPF start).
